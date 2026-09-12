@@ -90,6 +90,23 @@ WAYLANDDRV_PRIMARY_MONITOR=DP-2 %command%
 ```
 
 
+How do I disable window slicing?
+--------------------------------
+
+Slicing clips GPU-rendered content to shaped windows and complex child-window
+regions. To disable it for a game or launcher, use:
+
+```sh
+PROTON_WAYLAND_SLICING=0 %command%
+```
+
+Each affected buffer then uses a single rectangular surface. This also disables
+the four-pixel shape approximation, while preserving the original input region.
+Non-rectangular visual clipping is lost, so rectangular edges or child-window
+overlap may appear. Slicing is enabled by default; remove the option or set it
+to `1` to restore it. Restart the game after changing this setting.
+
+
 How do I resize a game's cursor?
 --------------------------------
 
