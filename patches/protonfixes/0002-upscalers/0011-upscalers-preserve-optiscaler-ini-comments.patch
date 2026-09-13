@@ -1,0 +1,251 @@
+From 3c6683181d91bac2a907f5c7f5ef81a7d95924d6 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Sun, 13 Sep 2026 23:56:18 +0200
+Subject: [PATCH] upscalers: Preserve OptiScaler INI comments.
+
+Update only the requested options during nightly setup and environment
+overrides. Preserve comments, key spelling, unrelated settings and line
+endings instead of serializing the complete file with ConfigParser.
+
+Cover stable and nightly setup, formatting preservation and rejected
+ambiguous edits with regression tests.
+---
+ optiscaler_nightly.py    | 82 ++++++++++++++++++++++++++++++++++------
+ tests/test_optiscaler.py | 54 +++++++++++++++++++++++++-
+ upscalers.py             | 13 ++++---
+ 3 files changed, 129 insertions(+), 20 deletions(-)
+
+diff --git a/optiscaler_nightly.py b/optiscaler_nightly.py
+index 98c6975..75dd567 100644
+--- a/optiscaler_nightly.py
++++ b/optiscaler_nightly.py
+@@ -161,6 +161,64 @@ def safe_name(name):
+     return path
+ 
+ 
++def update_ini(data, changes):
++    """Change single-line options without reserializing the rest of the INI."""
++    text = data.decode('utf-8-sig')
++    parser = configparser.ConfigParser(interpolation=None)
++    parser.read_string(text)
++    pending = {(section, key.lower()): value for (section, key), value in changes.items()}
++    for (section, key), value in pending.items():
++        if '\n' in value or '\r' in value:
++            raise ValueError('INI overrides must be single-line values')
++        if parser.has_option(section, key) and '\n' in parser[section][key]:
++            raise ValueError(f'Cannot replace multiline option {section}.{key}')
++
++    newline = '\r\n' if '\r\n' in text else '\n'
++    output, section, option_indent = [], None, None
++
++    def append_options(current):
++        for name in tuple(pending):
++            if name[0] != current:
++                continue
++            if output and not output[-1].endswith(('\n', '\r')):
++                output.append(newline)
++            # Preserve the requested spelling for newly added options too.
++            key = next(key for sec, key in changes if (sec, key.lower()) == name)
++            output.append(f'{key}={pending.pop(name)}{newline}')
++
++    for line in text.splitlines(keepends=True):
++        stripped = line.lstrip()
++        if not stripped or stripped.startswith((';', '#', '\n', '\r')):
++            output.append(line)
++            continue
++        indent = len(line) - len(stripped)
++        if option_indent is not None and indent > option_indent:
++            output.append(line)
++            continue
++        header = parser.SECTCRE.match(stripped)
++        if header:
++            append_options(section)
++            section = header['header']
++            option_indent = None
++        else:
++            option = re.match(r'^(\s*([^:=]+?)\s*[:=][ \t]*)(.*?)(\r?\n)?$', line)
++            if option:
++                option_indent = indent
++            if option and (name := (section, option[2].strip().lower())) in pending:
++                line = option[1] + pending.pop(name) + (option[4] or '')
++        output.append(line)
++    append_options(section)
++    for section, _ in tuple(pending):
++        if not any(name[0] == section for name in pending):
++            continue
++        if output and not output[-1].endswith(('\n', '\r')):
++            output.append(newline)
++        output.append(f'[{section}]{newline}')
++        append_options(section)
++    bom = b'\xef\xbb\xbf' if data.startswith(b'\xef\xbb\xbf') else b''
++    return bom + ''.join(output).encode('utf-8')
++
++
+ def prepare(item, cache, stage):
+     """Extract the nightly without running its setup scripts or flattening DLLs."""
+     stage = Path(stage)
+@@ -197,21 +255,21 @@ def prepare(item, cache, stage):
+         (stage / alias).symlink_to('OptiScaler.dll')
+         files.append(alias)
+     ini = stage / 'OptiScaler.ini'
+-    parser = configparser.ConfigParser(interpolation=None)
+-    parser.optionxform = str
+-    parser.read(ini, encoding='utf-8-sig')
+     library_path = r'c:\windows\system32\umu'
+-    parser['Libraries']['OptiDllPath'] = library_path + r'\OptiScaler'
+-    parser['Libraries']['NvngxDlssPath'] = library_path
+-    parser['Libraries']['NvngxFeaturePath'] = library_path
++    changes = {
++        ('Libraries', 'OptiDllPath'): library_path + r'\OptiScaler',
++        ('Libraries', 'NvngxDlssPath'): library_path,
++        ('Libraries', 'NvngxFeaturePath'): library_path,
++        ('Hotfix', 'CheckForUpdate'): 'false',
++        ('ProcessFilter', 'ProcessExclusionList'): '|'.join(EXCLUDED_PROCESSES),
++    }
+     if (stage / 'fakenvapi.dll').is_file():
+-        parser['Libraries']['NvapiPath'] = library_path + r'\fakenvapi.dll'
+-    parser['Hotfix']['CheckForUpdate'] = 'false'
+-    parser['ProcessFilter']['ProcessExclusionList'] = '|'.join(EXCLUDED_PROCESSES)
++        changes['Libraries', 'NvapiPath'] = library_path + r'\fakenvapi.dll'
++    parser = configparser.ConfigParser(interpolation=None)
++    parser.read(ini, encoding='utf-8-sig')
+     if parser.has_option('FSR', 'Fsr4Update'):
+-        parser['FSR']['Fsr4Update'] = 'true'
+-    with ini.open('w', encoding='utf-8') as output:
+-        parser.write(output)
++        changes['FSR', 'Fsr4Update'] = 'true'
++    atomic_write(ini, update_ini(ini.read_bytes(), changes))
+     if not (stage / 'OptiScaler.dll').is_file():
+         raise ValueError('Nightly archive has no OptiScaler.dll')
+     return {name: None if name.lower().endswith('.ini') else file_hash(stage / name, 'md5')
+diff --git a/tests/test_optiscaler.py b/tests/test_optiscaler.py
+index fd5b157..046bd5e 100644
+--- a/tests/test_optiscaler.py
++++ b/tests/test_optiscaler.py
+@@ -27,7 +27,8 @@ sys.modules[configuration.__name__] = configuration
+ nightly = importlib.import_module(package.__name__ + '.optiscaler_nightly')
+ upscalers = importlib.import_module(package.__name__ + '.upscalers')
+ 
+-INI = b'[Libraries]\nOptiDllPath=auto\n[Hotfix]\nCheckForUpdate=auto\n[ProcessFilter]\nProcessExclusionList=auto\n'
++INI = (b'; Header\n[Libraries]\n; Library location\nOptiDllPath=auto\n'
++       b'[Hotfix]\nCheckForUpdate=auto\n[ProcessFilter]\nProcessExclusionList=auto\n')
+ 
+ 
+ def release(tag='nightly-20260906'):
+@@ -104,7 +105,51 @@ class OptiscalerTests(unittest.TestCase):
+             self.assertTrue(self.setup(env={'PROTON_OPTISCALER_CONFIG': 'Hotfix.CheckForUpdate=false'}))
+             self.assertTrue(self.setup(self.version))
+             self.assertFalse(self.setup('nightly-20260905'))
+-        self.assertIn('checkforupdate = false', (self.destination / 'OptiScaler.ini').read_text())
++        self.assertIn('CheckForUpdate=false', (self.destination / 'OptiScaler.ini').read_text())
++        self.assertIn('; Library location', (self.destination / 'OptiScaler.ini').read_text())
++
++    def test_ini_preserves_comments_case_spacing_bom_and_newlines(self):
++        for newline in (b'\n', b'\r\n'):
++            source = b'\xef\xbb\xbf' + newline.join((
++                b'; File header', b'[Libraries]', b'; Explanation',
++                b'  OptiDllPath : auto', b'Other=100% unchanged', b'',
++                b'[Other]', b'OptiDllPath=untouched', b'# Last comment',
++            ))
++            expected = source.replace(b'OptiDllPath : auto', b'OptiDllPath : C:\\umu')
++            result = nightly.update_ini(source, {('Libraries', 'optidllpath'): r'C:\umu'})
++            self.assertEqual(result, expected)
++            self.assertEqual(nightly.update_ini(result, {}), result)
++
++    def test_ini_adds_missing_options_and_sections(self):
++        source = b'[Libraries]\r\nExisting=kept\r\n[Other]\r\nValue=kept'
++        result = nightly.update_ini(source, {('Libraries', 'NewPath'): 'new',
++                                            ('Added', 'Enabled'): 'true'})
++        self.assertEqual(result, b'[Libraries]\r\nExisting=kept\r\nNewPath=new\r\n'
++                                b'[Other]\r\nValue=kept\r\n[Added]\r\nEnabled=true\r\n')
++
++    def test_ini_rejects_ambiguous_or_multiline_edits(self):
++        for source, changes in (
++            (b'[S]\nKey=a\nKEY=b\n', {('S', 'Key'): 'c'}),
++            (b'[S]\nKey=a\n  continuation\n', {('S', 'Key'): 'c'}),
++            (b'[S]\nKey=a\n', {('S', 'Key'): 'a\nInjected=true'}),
++        ):
++            with self.assertRaises((ValueError, nightly.configparser.Error)):
++                nightly.update_ini(source, changes)
++
++    def test_ini_preserves_unrelated_multiline_values(self):
++        source = b'[S]\nOther=text\n  Key=not an option\nKey=auto\n'
++        self.assertEqual(nightly.update_ini(source, {('S', 'Key'): 'new'}),
++                         source.replace(b'Key=auto', b'Key=new'))
++
++    def test_unknown_config_does_not_rewrite_ini(self):
++        self.installed()
++        original = (self.destination / 'OptiScaler.ini').read_bytes()
++        with mock.patch.object(nightly, 'resolve', return_value=self.item), \
++                mock.patch.object(nightly, 'atomic_write') as write:
++            self.assertTrue(self.setup(env={'PROTON_OPTISCALER_CONFIG':
++                                           'Missing.Option=true;malformed'}))
++        write.assert_not_called()
++        self.assertEqual((self.destination / 'OptiScaler.ini').read_bytes(), original)
+ 
+     def test_empty_tracking_and_missing_ini_are_invalid(self):
+         (self.compat / 'upscaler_files').write_text('{"opti_files": {}}')
+@@ -175,6 +220,10 @@ class OptiscalerTests(unittest.TestCase):
+                 mock.patch.object(nightly, 'extractor', side_effect=AssertionError):
+             self.assertTrue(self.setup('default'))
+             self.assertTrue((self.destination / 'plugins/OptiPatcher.asi').is_file())
++            self.assertTrue(self.setup('default', {'PROTON_OPTISCALER_CONFIG':
++                                                  'Hotfix.checkforupdate=false'}))
++            self.assertEqual((self.destination / 'OptiScaler.ini').read_bytes(),
++                             INI.replace(b'CheckForUpdate=auto', b'CheckForUpdate=false'))
+             self.installed()
+             self.assertFalse((self.destination / 'plugins/OptiPatcher.asi').exists())
+             self.assertTrue(self.setup('default'))
+@@ -259,6 +308,7 @@ class OptiscalerTests(unittest.TestCase):
+         self.assertNotIn('setup_linux.sh', files)
+         parser = nightly.configparser.ConfigParser()
+         parser.read(stage / 'OptiScaler.ini')
++        self.assertIn('; Library location', (stage / 'OptiScaler.ini').read_text())
+         self.assertEqual(parser['Libraries']['OptiDllPath'], r'c:\windows\system32\umu\OptiScaler')
+         self.assertEqual(parser['Libraries']['NvngxDlssPath'], r'c:\windows\system32\umu')
+         self.assertEqual(parser['Hotfix']['CheckForUpdate'], 'false')
+diff --git a/upscalers.py b/upscalers.py
+index 89b3c33..1a90db3 100644
+--- a/upscalers.py
++++ b/upscalers.py
+@@ -3,7 +3,6 @@
+ import configparser
+ import fcntl
+ import hashlib
+-import io
+ import json
+ import lzma
+ import os
+@@ -563,8 +562,10 @@ def __setup_optiscaler(env, compat_dir, prefix_dir, version):
+ 
+     if enabled and (env_config := env.get('PROTON_OPTISCALER_CONFIG', '')):
+         ini = os.path.join(prefix_dir, nightly.ROOT, 'OptiScaler.ini')
++        original = Path(ini).read_bytes()
+         parser = configparser.ConfigParser(interpolation=None)
+-        parser.read(ini)
++        parser.read_string(original.decode('utf-8-sig'))
++        changes = {}
+ 
+         env_config_parts = env_config.split(';')
+         env_config_parts = (part for part in env_config_parts if part)
+@@ -577,13 +578,13 @@ def __setup_optiscaler(env, compat_dir, prefix_dir, version):
+                 log.debug(e)
+                 continue
+             if section in parser and option in parser[section]:
+-                parser[section][option] = value
++                changes[section, option] = value
+             else:
+                 log.warn(f'Ignoring unknown option "{f"{section}.{option}"}"')
+ 
+-        with io.StringIO() as ini_fd:
+-            parser.write(ini_fd)
+-            nightly.atomic_write(ini, ini_fd.getvalue().encode('utf-8'))
++        updated = nightly.update_ini(original, changes)
++        if updated != original:
++            nightly.atomic_write(ini, updated)
+ 
+     return enabled
+ 
+-- 
+2.55.0
+
