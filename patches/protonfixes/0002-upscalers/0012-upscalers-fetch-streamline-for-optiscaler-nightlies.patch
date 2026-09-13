@@ -1,0 +1,497 @@
+From 6f85c299a42077025ddd52010c46a6fd467e819b Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Mon, 14 Sep 2026 00:03:15 +0200
+Subject: [PATCH] upscalers: Fetch Streamline for OptiScaler nightlies.
+
+Install the verified official x64 Streamline runtime beside private
+nightly libraries, retaining licence notices and linking managed DLSS
+DLLs instead of installing duplicate copies.
+
+Track updates separately from OptiScaler and reuse the existing cache
+and rollback helpers. Keep working installations on download failures,
+respect untracked files, and leave stable-channel setup unchanged.
+
+Test runtime selection, dependency links, offline fallback, channel
+gating and failed-update rollback.
+---
+ optiscaler_streamline.py            | 143 +++++++++++++++++
+ tests/test_optiscaler.py            |  25 +++
+ tests/test_optiscaler_streamline.py | 233 ++++++++++++++++++++++++++++
+ upscalers.py                        |  14 +-
+ 4 files changed, 414 insertions(+), 1 deletion(-)
+ create mode 100644 optiscaler_streamline.py
+ create mode 100644 tests/test_optiscaler_streamline.py
+
+diff --git a/optiscaler_streamline.py b/optiscaler_streamline.py
+new file mode 100644
+index 0000000..602260e
+--- /dev/null
++++ b/optiscaler_streamline.py
+@@ -0,0 +1,143 @@
++"""Optional Streamline runtime for OptiScaler nightlies; no game files are replaced."""
++
++import json
++import os
++import re
++import shutil
++import stat
++import tempfile
++import urllib.request
++import zipfile
++from pathlib import Path
++
++from . import optiscaler_nightly as nightly
++from .logger import log
++
++
++REPOSITORY = 'NVIDIA-RTX/Streamline'
++ROOT = 'OptiScaler/streamline'
++REQUIRED = ('sl.interposer.dll', 'sl.common.dll', 'sl.dlss_g.dll', 'sl.reflex.dll', 'sl.pcl.dll')
++DLSS = ('nvngx_dlss.dll', 'nvngx_dlssd.dll', 'nvngx_dlssg.dll')
++
++
++def release_item(release):
++    tag = release['tag_name']
++    if not re.fullmatch(r'v\d+\.\d+\.\d+', tag) or release.get('draft') or release.get('prerelease'):
++        raise ValueError('Expected a stable Streamline SDK release')
++    # Windows x64 even on an ARM host running x64 games; exclude ARM native SDKs.
++    name = f'streamline-sdk-{tag}.zip'
++    assets = [asset for asset in release['assets'] if asset['name'] == name]
++    if len(assets) != 1:
++        raise ValueError('Expected one Windows x64 Streamline SDK asset')
++    asset = assets[0]
++    digest = asset.get('digest') or ''
++    url = f'https://github.com/{REPOSITORY}/releases/download/{tag}/{name}'
++    if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest) or asset['browser_download_url'] != url:
++        raise ValueError('Unverified Streamline SDK asset')
++    return {'version': tag, 'download_url': url, 'sha256': digest[7:]}
++
++
++def resolve(cache):
++    metadata = Path(cache) / 'streamline' / 'latest.json'
++    request = urllib.request.Request(f'https://api.github.com/repos/{REPOSITORY}/releases/latest',
++                                     headers={'User-Agent': 'Proton-OptiScaler'})
++    try:
++        with urllib.request.urlopen(request, timeout=10) as response:
++            release = json.load(response)
++        item = release_item(release)
++    except Exception as error:
++        log.warn(f'Cannot resolve Streamline: {error}')
++        return release_item(json.loads(metadata.read_text(encoding='utf-8')))
++    nightly.atomic_write(metadata, json.dumps(release).encode('utf-8'))
++    return item
++
++
++def prepare(item, cache, stage, destination):
++    if not (Path(destination) / 'nvngx_dlssg.dll').is_file():
++        raise ValueError('Streamline requires the managed nvngx_dlssg.dll')
++    archive = nightly.verified_download(item['download_url'],
++                                       Path(cache) / 'streamline' / (item['sha256'] + '.zip'),
++                                       item['sha256'])
++    files = {}
++    with zipfile.ZipFile(archive) as source:
++        # Some SDK archives wrap their contents in one versioned directory.
++        roots = {entry.filename[:-len('bin/x64/sl.interposer.dll')]
++                 for entry in source.infolist()
++                 if entry.filename.endswith('bin/x64/sl.interposer.dll')}
++        if len(roots) != 1:
++            raise ValueError('Ambiguous Streamline SDK layout')
++        root = roots.pop()
++        if root and not root.endswith('/'):
++            raise ValueError('Invalid Streamline SDK root')
++        for entry in source.infolist():
++            path = nightly.safe_name(entry.filename.rstrip('/'))
++            if entry.is_dir() or not entry.filename.startswith(root):
++                continue
++            name = entry.filename[len(root):]
++            runtime = name.startswith('bin/x64/') and '/' not in name[len('bin/x64/'):]
++            if runtime and path.suffix.lower() == '.dll':
++                if path.name.lower().startswith('nvngx_dlss'):
++                    continue
++                relative = f'{ROOT}/{path.name.lower()}'
++            elif '/' not in name and ('license' in name.lower() or 'notice' in name.lower()):
++                relative = f'{ROOT}/Licenses/{name}'
++            else:
++                continue
++            kind = stat.S_IFMT(entry.external_attr >> 16)
++            if kind not in (0, stat.S_IFREG) or relative in files:
++                raise ValueError(f'Unexpected Streamline SDK member: {entry.filename}')
++            target = Path(stage) / relative
++            target.parent.mkdir(parents=True, exist_ok=True)
++            with source.open(entry) as data, target.open('wb') as output:
++                shutil.copyfileobj(data, output)
++            files[relative] = {'sha256': nightly.file_hash(target)}
++    if any(f'{ROOT}/{name}' not in files for name in REQUIRED):
++        raise ValueError('Incomplete Streamline runtime')
++    if not any(name.startswith(f'{ROOT}/Licenses/') for name in files):
++        raise ValueError('Streamline SDK contains no licence notices')
++    for name in DLSS:
++        if (Path(destination) / name).is_file():
++            relative = f'{ROOT}/{name}'
++            link = '../../' + name
++            (Path(stage) / relative).symlink_to(link)
++            files[relative] = {'symlink': link}
++    return {name: {**record, 'version': item['version'], 'archive_sha256': item['sha256']}
++            for name, record in files.items()}
++
++
++def current(item, destination, records):
++    if any(f'{ROOT}/{name}' not in records for name in REQUIRED + ('nvngx_dlssg.dll',)):
++        return False
++    for name in DLSS:
++        if (Path(destination) / name).is_file() != (f'{ROOT}/{name}' in records):
++            return False
++    for name, record in records.items():
++        path = Path(destination) / name
++        if (record['version'] != item['version'] or record['archive_sha256'] != item['sha256']
++                or not path.is_file()):
++            return False
++        if 'symlink' in record:
++            if not path.is_symlink() or os.readlink(path) != record['symlink']:
++                return False
++        elif path.is_symlink() or nightly.file_hash(path) != record['sha256']:
++            return False
++    return True
++
++
++def setup(cache, destination, records, commit):
++    """The caller holds the prefix setup lock. Fail without disabling OptiScaler."""
++    try:
++        for name in records:
++            nightly.safe_name(name)
++            if not name.startswith(ROOT + '/'):
++                raise ValueError('Invalid Streamline tracking path')
++        item = resolve(cache)
++        if current(item, destination, records):
++            return
++        log.info(f'Updating OptiScaler Streamline runtime to {item["version"]}')
++        with tempfile.TemporaryDirectory(prefix='.streamline-stage-', dir=Path(destination).parent) as tmp:
++            stage = Path(tmp)
++            files = prepare(item, cache, stage, destination)
++            nightly.install(stage, destination, records, files, lambda: commit(files))
++    except Exception as error:
++        log.warn(f'Cannot update Streamline; keeping the previous installation: {error}')
+diff --git a/tests/test_optiscaler.py b/tests/test_optiscaler.py
+index 046bd5e..f5bfbf2 100644
+--- a/tests/test_optiscaler.py
++++ b/tests/test_optiscaler.py
+@@ -26,6 +26,7 @@ configuration.config = types.SimpleNamespace(path=types.SimpleNamespace(cache_di
+ sys.modules[configuration.__name__] = configuration
+ nightly = importlib.import_module(package.__name__ + '.optiscaler_nightly')
+ upscalers = importlib.import_module(package.__name__ + '.upscalers')
++streamline_setup = upscalers.streamline.setup
+ 
+ INI = (b'; Header\n[Libraries]\n; Library location\nOptiDllPath=auto\n'
+        b'[Hotfix]\nCheckForUpdate=auto\n[ProcessFilter]\nProcessExclusionList=auto\n')
+@@ -52,6 +53,10 @@ class OptiscalerTests(unittest.TestCase):
+         configuration.config.path.cache_dir = self.cache
+         self.version = 'nightly-20260906'
+         self.item = nightly._release_item(release(), self.version)
++        # Streamline's isolated downloader tests exercise the real setup path.
++        stream = mock.patch.object(upscalers.streamline, 'setup')
++        self.streamline_setup = stream.start()
++        self.addCleanup(stream.stop)
+ 
+     def package(self, item, cache, stage):
+         files = {'OptiScaler.dll': b'new DLL', 'OptiScaler.ini': INI,
+@@ -90,6 +95,26 @@ class OptiscalerTests(unittest.TestCase):
+         for alias in nightly.ALIASES:
+             self.assertEqual(os.readlink(self.destination / alias), 'OptiScaler.dll')
+ 
++    def test_streamline_only_follows_installed_nightly(self):
++        archive, item = self.stable_archive()
++        with mock.patch.object(upscalers, '__get_opti_files', return_value=(nightly.ROOT, item)), \
++                mock.patch.object(upscalers, '__cached_download', side_effect=lambda _, target:
++                                  (target.parent.mkdir(parents=True, exist_ok=True),
++                                   target.write_bytes(archive.read_bytes()))):
++            self.assertTrue(self.setup('default'))
++        self.streamline_setup.assert_not_called()
++        self.installed()
++        self.streamline_setup.assert_called_once()
++        with mock.patch.object(nightly, 'resolve', side_effect=OSError('offline')):
++            self.assertTrue(self.setup('nightly'))
++        self.assertEqual(self.streamline_setup.call_count, 2)
++
++    def test_failed_streamline_bootstrap_does_not_disable_optiscaler(self):
++        self.streamline_setup.side_effect = streamline_setup
++        with mock.patch.object(upscalers.streamline, 'resolve', side_effect=OSError('offline')):
++            self.installed()
++        self.assertTrue(upscalers.check_optiscaler(self.compat, self.prefix, ignore_version=True))
++
+     def test_current_install_resolves_once_without_extractor(self):
+         self.installed()
+         with mock.patch.object(nightly, 'resolve', return_value=self.item) as resolve, \
+diff --git a/tests/test_optiscaler_streamline.py b/tests/test_optiscaler_streamline.py
+new file mode 100644
+index 0000000..7dd9fc8
+--- /dev/null
++++ b/tests/test_optiscaler_streamline.py
+@@ -0,0 +1,233 @@
++"""Isolated Streamline tests: run directly with Python, without Wine or network."""
++
++import hashlib
++import io
++import json
++import os
++import stat
++import tempfile
++import unittest
++import zipfile
++from pathlib import Path
++from unittest import mock
++
++from test_optiscaler import nightly, upscalers
++
++
++streamline = upscalers.streamline
++
++
++def release(digest='a' * 64, tag='v2.14.1'):
++    name = f'streamline-sdk-{tag}.zip'
++    return {'tag_name': tag, 'assets': [{
++        'name': name, 'digest': 'sha256:' + digest,
++        'browser_download_url': f'https://github.com/{streamline.REPOSITORY}/releases/download/{tag}/{name}',
++    }]}
++
++
++class StreamlineTests(unittest.TestCase):
++    def setUp(self):
++        temporary = tempfile.TemporaryDirectory()
++        self.addCleanup(temporary.cleanup)
++        self.root = Path(temporary.name)
++        self.cache = self.root / 'cache'
++        self.destination = self.root / 'umu'
++        self.destination.mkdir()
++        for name in streamline.DLSS:
++            (self.destination / name).write_bytes(b'managed ' + name.encode())
++        self.records = {}
++        self.item = streamline.release_item(release())
++
++    def archive(self, *, prefix='', omit=(), extra=()):
++        data = io.BytesIO()
++        with zipfile.ZipFile(data, 'w') as output:
++            for name in streamline.REQUIRED + ('sl.dlss.dll',) + streamline.DLSS:
++                if name not in omit:
++                    output.writestr(prefix + 'bin/x64/' + name, b'SDK ' + name.encode())
++            output.writestr(prefix + 'bin/x64/development/sl.common.dll', b'never install debug')
++            output.writestr(prefix + 'bin/x64/README.txt', b'not runtime')
++            output.writestr(prefix + 'bin/x64/sl.interposer.lib', b'not runtime')
++            output.writestr(prefix + 'bin/aarch64/sl.common.dll', b'wrong architecture')
++            output.writestr(prefix + 'license.txt', b'SDK license')
++            output.writestr(prefix + '3rd-party-licenses.md', b'third party notices')
++            for name, payload in extra:
++                output.writestr(name, payload)
++        archive = self.root / 'sdk.zip'
++        archive.write_bytes(data.getvalue())
++        self.item = streamline.release_item(release(hashlib.sha256(data.getvalue()).hexdigest()))
++        return archive
++
++    def commit(self, records):
++        self.records = records
++
++    def setup(self, archive):
++        with mock.patch.object(streamline, 'resolve', return_value=self.item), \
++                mock.patch.object(nightly, 'verified_download', return_value=archive):
++            streamline.setup(self.cache, self.destination, self.records, self.commit)
++
++    def snapshot(self):
++        return {str(path.relative_to(self.destination)):
++                os.readlink(path) if path.is_symlink() else path.read_bytes()
++                for path in self.destination.rglob('*') if path.is_file() or path.is_symlink()}
++
++    def test_production_only_layout_links_and_licences(self):
++        for prefix in ('', 'streamline-sdk-v2.14.1/'):
++            with self.subTest(prefix=prefix):
++                self.setup(self.archive(prefix=prefix))
++                self.assertTrue(streamline.current(self.item, self.destination, self.records))
++                for name in streamline.DLSS:
++                    dll = self.destination / streamline.ROOT / name
++                    self.assertEqual(os.readlink(dll), '../../' + name)
++                    self.assertEqual(dll.read_bytes(), b'managed ' + name.encode())
++                self.assertEqual(len(self.records), 6 + 3 + 2)
++                self.assertEqual((self.destination / streamline.ROOT / 'Licenses/license.txt').read_bytes(),
++                                 b'SDK license')
++                self.assertFalse((self.destination / streamline.ROOT / 'development').exists())
++
++    def test_current_install_needs_no_download(self):
++        self.setup(self.archive())
++        with mock.patch.object(streamline, 'resolve', return_value=self.item), \
++                mock.patch.object(nightly, 'verified_download') as download:
++            streamline.setup(self.cache, self.destination, self.records, self.commit)
++        download.assert_not_called()
++
++    def test_managed_dlss_upgrade_uses_existing_links(self):
++        self.setup(self.archive())
++        (self.destination / 'nvngx_dlssg.dll').write_bytes(b'new managed version')
++        self.assertTrue(streamline.current(self.item, self.destination, self.records))
++        self.assertEqual((self.destination / streamline.ROOT / 'nvngx_dlssg.dll').read_bytes(),
++                         b'new managed version')
++
++    def test_corrupt_runtime_or_link_is_repaired(self):
++        archive = self.archive()
++        self.setup(archive)
++        target = self.destination / streamline.ROOT / 'sl.common.dll'
++        target.write_bytes(b'corrupt')
++        link = self.destination / streamline.ROOT / 'nvngx_dlssg.dll'
++        link.unlink()
++        link.symlink_to('../../nvngx_dlss.dll')
++        self.assertFalse(streamline.current(self.item, self.destination, self.records))
++        self.setup(archive)
++        self.assertTrue(streamline.current(self.item, self.destination, self.records))
++
++    def test_failed_download_keeps_installed_runtime(self):
++        self.setup(self.archive())
++        before = self.snapshot()
++        with mock.patch.object(streamline, 'resolve', return_value={**self.item, 'version': 'v2.15.0'}), \
++                mock.patch.object(nightly, 'verified_download', side_effect=OSError('offline')):
++            streamline.setup(self.cache, self.destination, self.records, self.commit)
++        self.assertEqual(before, self.snapshot())
++
++    def test_failed_commit_rolls_back_runtime_and_links(self):
++        archive = self.archive()
++        self.setup(archive)
++        before, records = self.snapshot(), self.records.copy()
++        archive = self.archive(extra=[('bin/x64/sl.new.dll', b'new')])
++        with mock.patch.object(streamline, 'resolve', return_value=self.item), \
++                mock.patch.object(nightly, 'verified_download', return_value=archive):
++            streamline.setup(self.cache, self.destination, self.records,
++                             mock.Mock(side_effect=OSError('disk full')))
++        self.assertEqual(before, self.snapshot())
++        self.assertEqual(records, self.records)
++
++    def test_failed_file_replace_rolls_back_runtime(self):
++        self.setup(self.archive())
++        before = self.snapshot()
++        archive = self.archive(extra=[('bin/x64/sl.new.dll', b'new')])
++        replace = os.replace
++
++        def fail(source, target):
++            if '.streamline-stage-' in str(source) and Path(target).name == 'sl.common.dll':
++                raise OSError('injected rename failure')
++            return replace(source, target)
++
++        with mock.patch.object(os, 'replace', side_effect=fail):
++            self.setup(archive)
++        self.assertEqual(before, self.snapshot())
++
++    def test_runtime_update_removes_only_old_owned_files(self):
++        self.setup(self.archive(extra=[('bin/x64/sl.old.dll', b'old')]))
++        custom = self.destination / streamline.ROOT / 'user.dll'
++        custom.write_bytes(b'custom')
++        self.setup(self.archive())
++        self.assertFalse((self.destination / streamline.ROOT / 'sl.old.dll').exists())
++        self.assertEqual(custom.read_bytes(), b'custom')
++
++    def test_untracked_conflict_or_parent_link_is_not_overwritten(self):
++        folder = self.destination / streamline.ROOT
++        folder.mkdir(parents=True)
++        (folder / 'sl.common.dll').write_bytes(b'user override')
++        before = self.snapshot()
++        self.setup(self.archive())
++        self.assertEqual(before, self.snapshot())
++        self.assertFalse(self.records)
++        (folder / 'sl.common.dll').unlink()
++        folder.rmdir()
++        outside = self.root / 'outside'
++        outside.mkdir()
++        folder.symlink_to(outside)
++        self.setup(self.archive())
++        self.assertEqual(list(outside.iterdir()), [])
++        self.assertFalse(self.records)
++
++    def test_incomplete_archive_or_missing_fg_keeps_existing_install(self):
++        self.setup(self.archive())
++        before = self.snapshot()
++        self.setup(self.archive(omit=('sl.common.dll',)))
++        self.assertEqual(before, self.snapshot())
++        (self.destination / 'nvngx_dlssg.dll').unlink()
++        before = self.snapshot()
++        self.setup(self.archive(extra=[('bin/x64/sl.new.dll', b'new')]))
++        self.assertEqual(before, self.snapshot())
++
++    def test_traversal_links_duplicates_and_ambiguous_layout_are_rejected(self):
++        link = zipfile.ZipInfo('bin/x64/sl.bad.dll')
++        link.create_system = 3
++        link.external_attr = (stat.S_IFLNK | 0o777) << 16
++        for extra in (
++            [('../escape', b'bad')],
++            [(r'bin\x64\sl.bad.dll', b'bad')],
++            [(link, b'/outside')],
++            [('bin/x64/SL.COMMON.DLL', b'case collision')],
++            [('other/bin/x64/sl.interposer.dll', b'ambiguous')],
++        ):
++            with self.subTest(extra=extra):
++                self.setup(self.archive(extra=extra))
++                self.assertFalse(self.records)
++                self.assertEqual(sorted(path.name for path in self.destination.iterdir()),
++                                 sorted(streamline.DLSS))
++
++    def test_tracking_cannot_target_another_package(self):
++        before = self.snapshot()
++        self.records = {'nvngx_dlss.dll': {}}
++        self.setup(self.archive())
++        self.assertEqual(before, self.snapshot())
++
++    def test_offline_resolution_uses_verified_cached_metadata(self):
++        with mock.patch.object(streamline.urllib.request, 'urlopen',
++                               return_value=io.BytesIO(json.dumps(release()).encode())):
++            expected = streamline.resolve(self.cache)
++        with mock.patch.object(streamline.urllib.request, 'urlopen', side_effect=OSError('offline')):
++            self.assertEqual(streamline.resolve(self.cache), expected)
++            with self.assertRaises(FileNotFoundError):
++                streamline.resolve(self.root / 'empty')
++
++    def test_wrong_release_architecture_url_and_digest_are_rejected(self):
++        for change in ('prerelease', 'draft', 'architecture', 'url', 'digest', 'duplicate'):
++            data = release()
++            if change in ('prerelease', 'draft'):
++                data[change] = True
++            elif change == 'architecture':
++                data['assets'][0]['name'] = 'streamline-sdk-v2.14.1-arm64ec.zip'
++            elif change == 'url':
++                data['assets'][0]['browser_download_url'] = 'https://example.com/sdk.zip'
++            elif change == 'digest':
++                data['assets'][0]['digest'] = None
++            else:
++                data['assets'].append(data['assets'][0])
++            with self.subTest(change=change), self.assertRaises(ValueError):
++                streamline.release_item(data)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/upscalers.py b/upscalers.py
+index 1a90db3..6b474a1 100644
+--- a/upscalers.py
++++ b/upscalers.py
+@@ -19,6 +19,7 @@ from urllib.parse import unquote, urlparse
+ from .logger import log
+ from .config import config
+ from . import optiscaler_nightly as nightly
++from . import optiscaler_streamline as streamline
+ 
+ 
+ __manifest_url = 'https://loathingkernel.github.io/proton-upscalers/manifest.json'
+@@ -558,7 +559,18 @@ def __setup_optiscaler(env, compat_dir, prefix_dir, version):
+     enabled = check_optiscaler(compat_dir, prefix_dir, version, ignore_version=True)
+     if enabled:
+         tracked = __get_tracked_items(compat_dir, __opti_section)
+-        log.info(f'Using OptiScaler "{next(iter(tracked.values()))["version"]}"')
++        installed_version = next(iter(tracked.values()))['version']
++        log.info(f'Using OptiScaler "{installed_version}"')
++        # Use the installed channel, including an offline fallback. Streamline is
++        # independently tracked so its failure cannot disable the main package.
++        if nightly.is_nightly(installed_version):
++            try:
++                records = __get_tracked_items(compat_dir, 'opti_streamline_files')
++            except (KeyError, FileNotFoundError):
++                records = {}
++            streamline.setup(config.path.cache_dir / 'upscalers', Path(prefix_dir) / nightly.ROOT,
++                             records, lambda files: __set_tracked_items(
++                                 compat_dir, 'opti_streamline_files', files))
+ 
+     if enabled and (env_config := env.get('PROTON_OPTISCALER_CONFIG', '')):
+         ini = os.path.join(prefix_dir, nightly.ROOT, 'OptiScaler.ini')
+-- 
+2.55.0
+

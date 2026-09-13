@@ -192,6 +192,17 @@ and verified before installation. Updates are checked at launch, not during
 gameplay. Previous INI files are saved as `.ini.old`, and
 `PROTON_OPTISCALER_CONFIG` is reapplied. Switch back to `1` to use stable again.
 
+Nightlies also fetch the latest official NVIDIA Streamline runtime for the
+frame-generation combinations that require it. Its DLLs and licence notices
+are installed under `umu/OptiScaler/streamline`, with links to the existing
+managed DLSS DLLs instead of duplicate copies. Private nightly libraries stay
+under `OptiScaler`; the entry DLL and INI stay in `umu`.
+
+The first Streamline download is the full SDK archive (currently about 276 MB);
+the installed runtime is about 10 MB. Downloads are verified and cached, and a
+failed update keeps the previous installation without disabling OptiScaler.
+Stable OptiScaler installations do not fetch Streamline automatically.
+
 
 What does it not promise?
 -------------------------
