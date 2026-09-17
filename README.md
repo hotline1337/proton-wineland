@@ -66,6 +66,46 @@ and media playback, and the rendering of overlays or companion windows,
 including cases where those windows are created by a separate process.
 
 
+What does it not promise?
+-------------------------
+
+No Proton version can guarantee that every game will work perfectly. Not every
+problem originates in Proton or can be solved within Wine. Issues may also come
+from the game itself, graphics drivers, the desktop compositor, or another part
+of the Linux graphics stack.
+
+
+Is it experimental?
+-------------------
+
+Yes, but "experimental" does not mean inherently unstable. Proton Wineland
+takes a different approach from the usual pattern of relying on environment
+variables, command line parameters, and Wine workarounds for individual titles.
+
+Where possible, it aims to solve the underlying problem in a durable way. This
+does not mean the project has no bugs, including in newly added areas, but being
+experimental does not mean deliberately sacrificing stability. In some
+situations, it may even be more stable than other Proton versions.
+
+
+How is artificial intelligence used?
+------------------------------------
+
+AI tools are a regular part of Proton Wineland's development process. I use
+them to analyse logs, investigate problems, review changes, and help fix or
+generate code when I consider that appropriate.
+
+Before delivery, every commit goes through a review assisted by AI. I examine
+the findings and decide whether the suggested changes are technically sound
+and suitable for the project. When they are, I may let the AI modify the code
+and then review the result again.
+
+AI does not replace engineering judgement, testing, or responsibility for the
+code that is delivered. Used thoughtfully, however, it is a valuable software
+development tool that can accelerate investigation and help identify problems
+that might otherwise be missed.
+
+
 How do I activate the Wayland features?
 ----------------------------------------
 
@@ -209,46 +249,6 @@ failed update keeps the previous installation without disabling OptiScaler.
 Stable OptiScaler installations do not fetch Streamline automatically.
 
 
-What does it not promise?
--------------------------
-
-No Proton version can guarantee that every game will work perfectly. Not every
-problem originates in Proton or can be solved within Wine. Issues may also come
-from the game itself, graphics drivers, the desktop compositor, or another part
-of the Linux graphics stack.
-
-
-Is it experimental?
--------------------
-
-Yes, but "experimental" does not mean inherently unstable. Proton Wineland
-takes a different approach from the usual pattern of relying on environment
-variables, command line parameters, and Wine workarounds for individual titles.
-
-Where possible, it aims to solve the underlying problem in a durable way. This
-does not mean the project has no bugs, including in newly added areas, but being
-experimental does not mean deliberately sacrificing stability. In some
-situations, it may even be more stable than other Proton versions.
-
-
-How is artificial intelligence used?
-------------------------------------
-
-AI tools are a regular part of Proton Wineland's development process. I use
-them to analyse logs, investigate problems, review changes, and help fix or
-generate code when I consider that appropriate.
-
-Before delivery, every commit goes through a review assisted by AI. I examine
-the findings and decide whether the suggested changes are technically sound
-and suitable for the project. When they are, I may let the AI modify the code
-and then review the result again.
-
-AI does not replace engineering judgement, testing, or responsibility for the
-code that is delivered. Used thoughtfully, however, it is a valuable software
-development tool that can accelerate investigation and help identify problems
-that might otherwise be missed.
-
-
 What is the relationship to CachyOS Proton?
 -------------------------------------------
 
@@ -273,30 +273,6 @@ CachyOS has its own development priorities and established relationships with
 the Wine development process. Proton Wineland complements that work with an
 independent focus. I have great respect for the CachyOS maintainers and
 developers, and value their tremendous work.
-
-
-Can Proton Wineland be merged into other larger Proton projects?
----------------------------------------------------------------
-
-I cannot speak for the plans of other projects. Proton Wineland is open source,
-and anyone is free to use or adapt parts of it. For example, GE-Proton has
-already adopted its Status Notifier Item (SNI) support and a substantial part
-of its Wayland cross-process rendering work.
-
-What about upstream Wine and Valve's Wine work?
-------------------------------------------------
-
-A full merge into upstream Wine or Valve's Wine work is currently unlikely. My
-understanding is that Wine is pursuing its own approach to Wayland
-rendering across processes, which differs from Proton Wineland's design. I have
-not investigated the details of that work myself, so I do not want to speculate
-beyond that.
-
-The same is likely true for Valve's Wine work. Valve and upstream Wine have
-closely connected development efforts, with contributors working across both
-projects. Proton Wineland is therefore best understood as an independent
-project that can share ideas and individual improvements where appropriate,
-rather than something expected to be merged wholesale.
 
 
 Original Proton documentation
