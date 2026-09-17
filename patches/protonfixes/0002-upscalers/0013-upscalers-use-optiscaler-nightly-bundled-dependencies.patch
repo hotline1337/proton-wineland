@@ -1,0 +1,353 @@
+Subject: [PATCH] upscalers: Use OptiScaler nightly's bundled dependencies.
+
+Avoid downloading standalone XeSS and FidelityFX libraries solely for a
+nightly. Follow the installed channel for offline fallback and retain
+explicit standalone upgrades and shared DLSS libraries.
+
+Migrate only checksum-matching installer-owned duplicates with validated
+bundled replacements. Preserve custom paths and user files, and roll back
+removal if tracking cannot be saved. Cover selection and migration in tests.
+
+---
+diff --git a/tests/test_optiscaler.py b/tests/test_optiscaler.py
+index f5bfbf2..fc8b57b 100644
+--- a/tests/test_optiscaler.py
++++ b/tests/test_optiscaler.py
+@@ -95,6 +95,212 @@ class OptiscalerTests(unittest.TestCase):
+         for alias in nightly.ALIASES:
+             self.assertEqual(os.readlink(self.destination / alias), 'OptiScaler.dll')
+ 
++    def dependency_files(self, section, files):
++        tracking = self.compat / 'upscaler_files'
++        records = json.loads(tracking.read_text()) if tracking.exists() else {}
++        records.setdefault(section, {})
++        for name, data in files.items():
++            target = self.destination / name
++            target.parent.mkdir(parents=True, exist_ok=True)
++            target.write_bytes(data)
++            records[section][f'{nightly.ROOT}/{name}'] = {
++                'version': self.version, 'md5_hash': hashlib.md5(data).hexdigest(),
++            }
++        tracking.write_text(json.dumps(records))
++
++    def bundled_dependencies(self):
++        self.installed()
++        self.dependency_files('opti_files', {
++            'OptiScaler/libxess_dx11.dll': b'bundled dx11',
++            'OptiScaler/libxell.dll': b'bundled xell',
++            'OptiScaler/libxess_fg.dll': b'bundled xefg',
++            'OptiScaler/amd_fidelityfx_vk.dll': b'bundled vulkan',
++            'OptiScaler/amd_fidelityfx_loader_dx12.dll': b'bundled loader',
++            'OptiScaler/amd_fidelityfx_upscaler_dx12.dll': b'bundled upscaler',
++            'OptiScaler/amd_fidelityfx_framegeneration_dx12.dll': b'bundled fg',
++        })
++        ini = self.destination / 'OptiScaler.ini'
++        ini.write_bytes(nightly.update_ini(ini.read_bytes(), {
++            ('Libraries', 'OptiDllPath'): r'c:\windows\system32\umu\OptiScaler',
++        }))
++
++    def run_upscalers(self, config=(), env=None, *, optiscaler_enabled=True):
++        env = {'PROTON_USE_OPTISCALER': 'nightly', **(env or {})}
++        # Exercise policy/cleanup without the independent downloaders or Wine.
++        with mock.patch.object(upscalers, 'setup_upscaler', return_value=True) as setup, \
++                mock.patch.object(upscalers, 'setup_optiscaler', return_value=optiscaler_enabled):
++            upscalers.setup_upscalers(set(config) | {'optiscaler'}, env, self.compat, self.prefix)
++        return env, [(call.args[0], call.args[3]) for call in setup.call_args_list]
++
++    def test_nightly_skips_implicit_xess_and_fidelityfx_downloads(self):
++        self.bundled_dependencies()
++        env, calls = self.run_upscalers()
++        self.assertEqual(calls, [('dlss', 'default'), ('fsr4', 'default')])
++        self.assertEqual(env['WINE_OPTISCALER_NAME'], 'dxgi.dll')
++        self.assertNotIn('WINE_UPSCALER_REPLACE', env)
++
++    def test_explicit_upgrades_keep_their_versions_and_files(self):
++        self.bundled_dependencies()
++        files = {'libxess.dll': b'explicit xess'}
++        self.dependency_files('xess_files', files)
++        self.dependency_files('ffx3_files', {'amd_fidelityfx_vk.dll': b'explicit ffx'})
++        _, calls = self.run_upscalers({'xess', 'ffx3', 'ffx4'}, {
++            'PROTON_XESS_UPGRADE': 'test-xess', 'PROTON_FFX3_UPGRADE': 'test-ffx3',
++            'PROTON_FFX4_UPGRADE': 'test-ffx4',
++        })
++        for item in [('xess', 'test-xess'), ('ffx3', 'test-ffx3'), ('ffx4', 'test-ffx4')]:
++            self.assertIn(item, calls)
++        self.assertEqual((self.destination / 'libxess.dll').read_bytes(), files['libxess.dll'])
++        self.assertTrue((self.destination / 'amd_fidelityfx_vk.dll').exists())
++
++    def test_stable_fallback_still_downloads_standalone_dependencies(self):
++        self.bundled_dependencies()
++        tracking = self.compat / 'upscaler_files'
++        records = json.loads(tracking.read_text())
++        for record in records['opti_files'].values():
++            record['version'] = '0.9.0'
++        tracking.write_text(json.dumps(records))
++        _, calls = self.run_upscalers()
++        self.assertIn(('xess', 'default'), calls)
++        self.assertIn(('ffx3', '1.0.1.41314'), calls)
++
++    def test_nightly_fallback_to_stable_request_still_uses_bundled_dependencies(self):
++        self.bundled_dependencies()
++        _, calls = self.run_upscalers(env={'PROTON_USE_OPTISCALER': '1'})
++        self.assertNotIn('xess', [name for name, _ in calls])
++        self.assertNotIn('ffx3', [name for name, _ in calls])
++
++    def test_failed_optiscaler_preserves_standalone_fallback(self):
++        self.bundled_dependencies()
++        self.dependency_files('xess_files', {'libxess.dll': b'keep'})
++        env, calls = self.run_upscalers(optiscaler_enabled=False)
++        self.assertIn(('xess', 'default'), calls)
++        self.assertIn(('ffx3', '1.0.1.41314'), calls)
++        self.assertEqual(set(env['WINE_UPSCALER_REPLACE'].split(',')), {'dlss', 'xess', 'ffx3'})
++        self.assertNotIn('WINE_OPTISCALER_NAME', env)
++        self.assertTrue((self.destination / 'libxess.dll').exists())
++
++    def test_prunes_only_matching_owned_files_and_updates_tracking(self):
++        self.bundled_dependencies()
++        self.dependency_files('xess_files', {'libxess.dll': b'old xess', 'libxell.dll': b'old xell'})
++        self.dependency_files('ffx3_files', {'amd_fidelityfx_vk.dll': b'old vk',
++                                           'amd_fidelityfx_dx12.dll': b'old combined'})
++        # Extra names in a tracker are not permission to delete arbitrary files.
++        self.dependency_files('xess_files', {'unrelated.dll': b'keep'})
++        before_ini = (self.destination / 'OptiScaler.ini').read_bytes()
++        self.run_upscalers()
++        for name in ('libxess.dll', 'libxell.dll', 'amd_fidelityfx_vk.dll', 'amd_fidelityfx_dx12.dll'):
++            self.assertFalse((self.destination / name).exists())
++        records = json.loads((self.compat / 'upscaler_files').read_text())
++        self.assertEqual(set(records['xess_files']), {f'{nightly.ROOT}/unrelated.dll'})
++        self.assertEqual(records['ffx3_files'], {})
++        self.assertTrue(upscalers.check_optiscaler(self.compat, self.prefix, ignore_version=True))
++        self.assertEqual((self.destination / 'OptiScaler.ini').read_bytes(), before_ini)
++        self.run_upscalers()  # Migration is idempotent.
++        self.assertEqual(json.loads((self.compat / 'upscaler_files').read_text()), records)
++
++    def test_migration_keeps_modified_untracked_symlinked_and_unhashed_files(self):
++        self.bundled_dependencies()
++        self.dependency_files('xess_files', {'libxess.dll': b'original',
++                                           'libxell.dll': b'original',
++                                           'libxess_fg.dll': b'original'})
++        (self.destination / 'libxess.dll').write_bytes(b'user version')
++        (self.destination / 'libxess_dx11.dll').write_bytes(b'untracked')
++        (self.destination / 'libxell.dll').unlink()
++        (self.destination / 'libxell.dll').symlink_to('OptiScaler/libxell.dll')
++        tracking = self.compat / 'upscaler_files'
++        records = json.loads(tracking.read_text())
++        records['xess_files'][f'{nightly.ROOT}/libxess_fg.dll']['md5_hash'] = None
++        tracking.write_text(json.dumps(records))
++        before = self.snapshot()
++        self.run_upscalers()
++        self.assertEqual(self.snapshot(), before)
++
++    def test_migration_requires_valid_bundled_replacements(self):
++        self.bundled_dependencies()
++        self.dependency_files('xess_files', {'libxess.dll': b'old'})
++        self.dependency_files('ffx3_files', {'amd_fidelityfx_dx12.dll': b'old'})
++        (self.destination / 'OptiScaler/libxess.dll').write_bytes(b'corrupt')
++        (self.destination / 'OptiScaler/amd_fidelityfx_framegeneration_dx12.dll').unlink()
++        before = self.snapshot()
++        self.run_upscalers()
++        self.assertEqual(self.snapshot(), before)
++
++    def test_migration_preserves_custom_library_paths(self):
++        self.bundled_dependencies()
++        self.dependency_files('xess_files', {'libxess.dll': b'old'})
++        self.dependency_files('ffx3_files', {'amd_fidelityfx_dx12.dll': b'old'})
++        ini = self.destination / 'OptiScaler.ini'
++        original = ini.read_bytes()
++        for changes in (
++            {('Libraries', 'OptiDllPath'): r'c:\windows\system32\umu'},
++            {('Libraries', 'XeSSPath'): r'c:\custom', ('Libraries', 'FfxDx12Path'): r'c:\custom'},
++        ):
++            ini.write_bytes(nightly.update_ini(original, changes))
++            before = self.snapshot()
++            self.run_upscalers()
++            self.assertEqual(self.snapshot(), before)
++
++    def test_migration_restores_files_when_tracking_write_fails(self):
++        self.bundled_dependencies()
++        self.dependency_files('xess_files', {'libxess.dll': b'old'})
++        before = self.snapshot()
++        with mock.patch.object(upscalers, '__set_tracked_items', side_effect=OSError('disk full')):
++            self.run_upscalers()
++        self.assertEqual(self.snapshot(), before)
++
++    def test_migration_keeps_dlss_and_explicit_ffx4_files(self):
++        self.bundled_dependencies()
++        self.dependency_files('dlss_files', {'nvngx_dlss.dll': b'shared dlss'})
++        self.dependency_files('ffx4_files', {'amd_fidelityfx_loader_dx12.dll': b'upgrade'})
++        before = self.snapshot()
++        self.run_upscalers({'ffx4'})
++        self.assertEqual(self.snapshot(), before)
++
++    def test_migration_keeps_files_with_a_linked_dependency_directory(self):
++        self.bundled_dependencies()
++        self.dependency_files('xess_files', {'libxess.dll': b'old'})
++        (self.destination / 'OptiScaler').rename(self.destination / 'libraries')
++        (self.destination / 'OptiScaler').symlink_to('libraries', target_is_directory=True)
++        before = self.snapshot()
++        self.run_upscalers()
++        self.assertEqual(self.snapshot(), before)
++
++    def test_real_offline_nightly_setup_migrates_without_dependency_downloads(self):
++        self.bundled_dependencies()
++        self.dependency_files('xess_files', {'libxess.dll': b'old'})
++        env = {'PROTON_USE_OPTISCALER': 'nightly'}
++        with mock.patch.object(nightly, 'resolve', side_effect=OSError('offline')), \
++                mock.patch.object(upscalers, 'setup_upscaler', return_value=True) as setup:
++            upscalers.setup_upscalers({'optiscaler'}, env, self.compat, self.prefix)
++        self.assertEqual([call.args[0] for call in setup.call_args_list], ['dlss', 'fsr4'])
++        self.assertEqual(env['WINE_OPTISCALER_NAME'], 'dxgi.dll')
++        self.assertFalse((self.destination / 'libxess.dll').exists())
++
++    def test_real_stable_offline_fallback_keeps_standalone_dependencies(self):
++        archive, item = self.stable_archive()
++        nightly.prepare_stable(archive, item['md5_hash'], self.destination)
++        records = {f'{nightly.ROOT}/{name}': {'md5_hash': checksum, 'version': item['version']}
++                   for name, checksum in item['md5_hash'].items()}
++        (self.compat / 'upscaler_files').write_text(json.dumps({'opti_files': records}))
++        self.dependency_files('xess_files', {'libxess.dll': b'keep stable dependency'})
++        env = {'PROTON_USE_OPTISCALER': 'nightly'}
++        with mock.patch.object(nightly, 'resolve', side_effect=OSError('offline')), \
++                mock.patch.object(upscalers, 'setup_upscaler', return_value=True) as setup:
++            upscalers.setup_upscalers({'optiscaler'}, env, self.compat, self.prefix)
++        self.assertEqual([call.args[0] for call in setup.call_args_list], ['dlss', 'fsr4', 'xess', 'ffx3'])
++        self.assertEqual(env['WINE_OPTISCALER_NAME'], 'dxgi.dll')
++        self.assertEqual((self.destination / 'libxess.dll').read_bytes(), b'keep stable dependency')
++
++    def test_standalone_upscalers_are_unchanged_without_optiscaler(self):
++        env = {'PROTON_XESS_UPGRADE': 'custom'}
++        with mock.patch.object(upscalers, 'setup_upscaler', return_value=True) as setup, \
++                mock.patch.object(upscalers, 'setup_optiscaler') as opti:
++            upscalers.setup_upscalers({'xess', 'ffx3'}, env, self.compat, self.prefix)
++        self.assertEqual([call.args[0] for call in setup.call_args_list], ['xess', 'fsr4', 'ffx3'])
++        self.assertEqual(set(env['WINE_UPSCALER_REPLACE'].split(',')), {'xess', 'ffx3'})
++        opti.assert_not_called()
++
+     def test_streamline_only_follows_installed_nightly(self):
+         archive, item = self.stable_archive()
+         with mock.patch.object(upscalers, '__get_opti_files', return_value=(nightly.ROOT, item)), \
+diff --git a/upscalers.py b/upscalers.py
+index 6b474a1..54007a6 100644
+--- a/upscalers.py
++++ b/upscalers.py
+@@ -5,6 +5,7 @@ import fcntl
+ import hashlib
+ import json
+ import lzma
++import ntpath
+ import os
+ import tarfile
+ import tempfile
+@@ -633,6 +634,73 @@ def get_version(env: dict, key: str, fallback: str) -> str:
+     return env[key] if env.get(key, '0') not in {'0', '1'} else fallback
+ 
+ 
++def __prune_optiscaler_dependencies(name, compat_dir, prefix_dir):
++    """Remove unchanged standalone files superseded by a validated nightly."""
++    dlls = {
++        'xess': ('libxess.dll', 'libxess_dx11.dll', 'libxell.dll', 'libxess_fg.dll'),
++        'ffx3': ('amd_fidelityfx_dx12.dll', 'amd_fidelityfx_vk.dll'),
++    }[name]
++    section = __xess_section if name == 'xess' else __ffx3_section
++    destination = Path(prefix_dir) / nightly.ROOT
++    try:
++        with open(Path(compat_dir) / '.optiscaler.lock', 'a') as lock:
++            fcntl.flock(lock, fcntl.LOCK_EX)
++            package = __get_tracked_items(compat_dir, __opti_section)
++            if not nightly.is_nightly(next(iter(package.values()))['version']):
++                return
++            if (destination / 'OptiScaler').is_symlink():
++                return
++            tracked = __get_tracked_items(compat_dir, section)
++            parser = configparser.ConfigParser(interpolation=None)
++            parser.read(destination / 'OptiScaler.ini', encoding='utf-8-sig')
++            libraries = parser['Libraries']
++            # A custom search path may intentionally use the standalone files.
++            if ntpath.normcase(ntpath.normpath(libraries.get('OptiDllPath', 'auto'))) != \
++                    ntpath.normcase(r'c:\windows\system32\umu\OptiScaler'):
++                return
++            prefixes = ('xess', 'xefg', 'xell') if name == 'xess' else ('ffx',)
++            if any(key.startswith(prefixes) and value.strip().lower() not in ('', 'auto')
++                   for key, value in libraries.items()):
++                return
++
++            removed = []
++            remaining = dict(tracked)
++            for dll in dlls:
++                path = f'{nightly.ROOT}/{dll}'
++                checksum = tracked.get(path, {}).get('md5_hash')
++                target = destination / dll
++                if not checksum or target.is_symlink() or not target.is_file():
++                    continue
++                if nightly.file_hash(target, 'md5') != checksum.lower():
++                    continue
++                replacements = (dll,)
++                # Newer FidelityFX packages split the old combined DX12 library.
++                if dll == 'amd_fidelityfx_dx12.dll' and \
++                        f'{nightly.ROOT}/OptiScaler/{dll}' not in package:
++                    replacements = ('amd_fidelityfx_loader_dx12.dll',
++                                    'amd_fidelityfx_upscaler_dx12.dll',
++                                    'amd_fidelityfx_framegeneration_dx12.dll')
++                for replacement in replacements:
++                    bundled = f'{nightly.ROOT}/OptiScaler/{replacement}'
++                    expected = package.get(bundled, {}).get('md5_hash')
++                    file = Path(prefix_dir) / bundled
++                    if (not expected or file.is_symlink() or not file.is_file()
++                            or nightly.file_hash(file, 'md5') != expected.lower()):
++                        break
++                else:
++                    removed.append(dll)
++                    del remaining[path]
++            if removed:
++                # Delete-only transaction: no files are read from the staging path.
++                nightly.install(destination, destination, removed, (),
++                                lambda: __set_tracked_items(compat_dir, section, remaining))
++                log.info(f'Removed redundant OptiScaler dependencies: {", ".join(removed)}')
++    except (KeyError, StopIteration, FileNotFoundError):
++        return
++    except Exception as error:
++        log.warn(f'Keeping standalone {name.upper()} files: {error}')
++
++
+ def setup_upscalers(
+     compat_config: set, env: dict, compat_dir: str, prefix_dir: str
+ ) -> None:
+@@ -656,10 +724,10 @@ def setup_upscalers(
+     upscaler_replace = set()
+     upscalers = (
+         ('dlss', dlss_version, 'dlss' in compat_config or 'optiscaler' in compat_config),
+-        ('xess', xess_version, 'xess' in compat_config or 'optiscaler' in compat_config),
++        ('xess', xess_version, 'xess' in compat_config),
+         # amdxcffx64 4.1.1
+         ('fsr4', fsr4_version, True),
+-        ('ffx3', ffx3_version, 'ffx3' in compat_config or 'optiscaler' in compat_config),
++        ('ffx3', ffx3_version, 'ffx3' in compat_config),
+         ('ffx4', ffx4_version, 'ffx4' in compat_config),
+     )
+     for upscaler in upscalers:
+@@ -669,7 +737,24 @@ def setup_upscalers(
+             upscaler_replace.add(name)
+ 
+     if 'optiscaler' in compat_config:
+-        if setup_optiscaler(env, compat_dir, prefix_dir, optiscaler_version):
++        optiscaler_enabled = setup_optiscaler(env, compat_dir, prefix_dir, optiscaler_version)
++        installed_nightly = False
++        if optiscaler_enabled:
++            try:
++                records = __get_tracked_items(compat_dir, __opti_section)
++                installed_nightly = nightly.is_nightly(next(iter(records.values()))['version'])
++            except (KeyError, StopIteration, OSError, ValueError):
++                pass
++        # Follow the installed channel, including an offline fallback. Only
++        # nightlies bundle these dependencies; explicit upgrades remain separate.
++        for name, version in (('xess', xess_version), ('ffx3', ffx3_version)):
++            if name in compat_config:
++                continue
++            if installed_nightly:
++                __prune_optiscaler_dependencies(name, compat_dir, prefix_dir)
++            elif setup_upscaler(name, compat_dir, prefix_dir, version):
++                upscaler_replace.add(name)
++        if optiscaler_enabled:
+             log.info('OptiScaler enabled.')
+             if 'fsr4' in compat_config:
+                 if ffx4_version in {'4.0.0', '4.0.1'}:

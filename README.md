@@ -198,6 +198,11 @@ are installed under `umu/OptiScaler/streamline`, with links to the existing
 managed DLSS DLLs instead of duplicate copies. Private nightly libraries stay
 under `OptiScaler`; the entry DLL and INI stay in `umu`.
 
+Nightlies use their bundled XeSS and FidelityFX libraries instead of fetching
+extra standalone copies. Explicit upscaler upgrades remain available. Existing
+installer-owned duplicates are removed only when unchanged; modified files
+and custom library paths are preserved.
+
 The first Streamline download is the full SDK archive (currently about 276 MB);
 the installed runtime is about 10 MB. Downloads are verified and cached, and a
 failed update keeps the previous installation without disabling OptiScaler.
