@@ -1710,13 +1710,6 @@ class Session:
         OpenGL can opt in to the same input proxy through an EGL-to-GLX adapter
         preloaded after Steam's native overlay renderer.
         """
-        # Avoid adding the layer to the known EAC and BattlEye runtime paths.
-        for var in ("PROTON_EAC_RUNTIME", "PROTON_BATTLEYE_RUNTIME"):
-            if self.env.get(var):
-                log("Steam overlay bridge disabled: " + var + " is in use")
-                self.env["PROTON_WAYLAND_STEAM_OVERLAY"] = "0"
-                return
-
         if (not nonzero(self.env.get("ENABLE_VK_LAYER_VALVE_steam_overlay_1", "0")) or
             nonzero(self.env.get("DISABLE_VK_LAYER_VALVE_steam_overlay_1", "0"))):
             log("Steam overlay bridge disabled: native overlay is unavailable")
