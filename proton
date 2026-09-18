@@ -1718,13 +1718,14 @@ class Session:
 
         share_dir = g_proton.path("files/share")
         manifest_dir = os.path.join(share_dir, "vulkan/explicit_layer.d")
-        manifests = []
-        for arch in ("x86_64", "i386"):
-            manifest = "VkLayer_WINELAND_translate_" + arch + ".json"
-            if os.path.exists(os.path.join(manifest_dir, manifest)):
-                manifests.append(manifest)
+        # WoW64 uses 64-bit Unix libraries for both PE architectures. Its
+        # i386-unix directory contains only compatibility loaders.
+        unix_archs = ["x86_64"]
+        if os.path.isfile(g_proton.path("files/lib/wine/i386-unix/ntdll.so")):
+            unix_archs.append("i386")
 
-        if len(manifests) != 2:
+        if any(not os.path.exists(os.path.join(manifest_dir, "VkLayer_WINELAND_translate_" + arch + ".json"))
+               for arch in unix_archs):
             log("Steam overlay bridge disabled: translation layer is unavailable")
             self.env["PROTON_WAYLAND_STEAM_OVERLAY"] = "0"
             return
