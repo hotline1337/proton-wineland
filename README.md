@@ -225,6 +225,16 @@ Append DXVK HUD options after the preset to customise it, for example:
 PROTON_HUD=3,scale=1.25,-gpu.temp %command%
 ```
 
+Add `present.mode` to show the Vulkan presentation mode, such as `FIFO`, `MAILBOX`
+or `IMMEDIATE`, in Direct3D 8 through 12 games:
+
+```sh
+PROTON_HUD=3,present.mode %command%
+```
+
+This shows the renderer's selected mode. The compositor may still control how
+frames reach the display. No latency telemetry is needed for this field.
+
 An explicit `DXVK_HUD` takes precedence. See the [DXVK HUD options](dxvk/README.md#hud)
 for individual metrics, layout, and appearance settings.
 
