@@ -655,6 +655,10 @@ $(eval $(call rules-configure,ffmpeg,i386,unix))
 $(eval $(call rules-configure,ffmpeg,x86_64,unix))
 $(eval $(call rules-configure,ffmpeg,aarch64,unix))
 
+$(OBJ)/.ffmpeg-post-source: patches-source
+	$(foreach p,$(sort $(wildcard $(SRC)/patches/ffmpeg/*.patch)),patch -d $(FFMPEG_SRC) -Np1 -i $(PATCHES_SRC)/ffmpeg/$(notdir $(p)) &&) true
+	touch $@
+
 
 ##
 ## gst-libav

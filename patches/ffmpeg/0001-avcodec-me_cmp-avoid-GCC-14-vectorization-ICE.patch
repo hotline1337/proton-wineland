@@ -1,0 +1,27 @@
+Subject: avcodec/me_cmp: Avoid GCC 14 loop vectorization ICE.
+
+The pinned Steam Runtime SDK's GCC 14.2 crashes in prepare_cmp_insn
+when compiling nsse16_c and vsad8_c for the x86-64 baseline with loop
+vectorization.
+FFmpeg now enables this optimization, exposing GCC PR124555.
+
+Disable only loop vectorization in this file on GCC 14/x86-64.
+Keep other files, assembly implementations and compilers unchanged.
+
+https://gcc.gnu.org/bugzilla/show_bug.cgi?id=124555
+
+diff --git a/libavcodec/me_cmp.c b/libavcodec/me_cmp.c
+--- a/libavcodec/me_cmp.c
++++ b/libavcodec/me_cmp.c
+@@ -34,6 +34,11 @@
+ #include "config.h"
+ #include "config_components.h"
+
++#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 14 && ARCH_X86_64
++/* GCC PR124555: vector abs expansion can ICE without SSE4 support. */
++#pragma GCC optimize("no-tree-loop-vectorize")
++#endif
++
+ static int sse4_c(MPVEncContext *unused, const uint8_t *pix1, const uint8_t *pix2,
+                   ptrdiff_t stride, int h)
+ {
