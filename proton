@@ -40,6 +40,7 @@ from random import randrange
 
 import protonfixes
 import desktop_monitor
+import vulkan_layers
 
 #To enable debug logging, copy "user_settings.sample.py" to "user_settings.py"
 #and edit it if needed.
@@ -1702,14 +1703,16 @@ class Session:
         translation layer shipped in this package rewrites it back to Wayland
         below the overlay layer.
 
-        Steam enables its overlay as an implicit layer. Wine explicitly places
-        the matching translation layer below it in the host
-        VkInstanceCreateInfo. Proton exposes the package-private translation
-        manifests through the loader's active explicit-layer search path.
+        Steam enables its overlay as an implicit layer. Wine requests the
+        matching translation layer in the host VkInstanceCreateInfo. Private
+        loader settings put Steam first, translation second, and other enabled
+        layers afterwards. If ordering cannot be verified, disable the bridge
+        and leave normal Wayland presentation and other overlays untouched.
 
         OpenGL can opt in to the same input proxy through an EGL-to-GLX adapter
         preloaded after Steam's native overlay renderer.
         """
+        self.env.pop("PROTON_WAYLAND_VULKAN_LAYER_ORDER", None)
         if (not nonzero(self.env.get("ENABLE_VK_LAYER_VALVE_steam_overlay_1", "0")) or
             nonzero(self.env.get("DISABLE_VK_LAYER_VALVE_steam_overlay_1", "0"))):
             log("Steam overlay bridge disabled: native overlay is unavailable")
@@ -1730,11 +1733,15 @@ class Session:
             self.env["PROTON_WAYLAND_STEAM_OVERLAY"] = "0"
             return
 
-        # Wine explicitly places MangoHud below the surface translation layer.
-        if self.env.get("MANGOHUD") == "1":
-            self.env["DISABLE_MANGOHUD"] = "1"
-
         utilities.add_vk_explicit_layer(prepend_to_env_str, self.env, manifest_dir)
+
+        # Require loader-native ordering, leaving other layers' names and normal
+        # activation untouched.
+        if not vulkan_layers.configure(self.env, manifest_dir, unix_archs,
+                                       g_compatdata.path("wineland-vulkan"), log):
+            log("Steam overlay bridge disabled: Vulkan layer ordering could not be verified")
+            self.env["PROTON_WAYLAND_STEAM_OVERLAY"] = "0"
+            return
 
         # Opt in per game: the launcher does not know which graphics API it uses.
         if not nonzero(self.env.get("PROTON_WAYLAND_OPENGL_OVERLAY", "0")):
@@ -2377,7 +2384,8 @@ class Session:
                 self.log_file.write("PATH: " + str(self.env.get("PATH", None)) + "\n")
 
                 #dump some important variables into the log header
-                for var in ["WINEDLLOVERRIDES", "WINEDEBUG"]:
+                for var in ["WINEDLLOVERRIDES", "WINEDEBUG", "PROTON_WAYLAND_STEAM_OVERLAY",
+                            "PROTON_WAYLAND_VULKAN_LAYER_ORDER", "XDG_CONFIG_DIRS"]:
                     if var in os.environ:
                         self.log_file.write("System " + var + ": " + os.environ[var] + "\n")
                     if var in used_user_settings:

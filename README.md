@@ -114,6 +114,25 @@ default by setting `PROTON_ENABLE_WAYLAND=1`, so games and supporting
 applications run through Wayland automatically.
 
 
+How are Vulkan overlays ordered?
+--------------------------------
+
+With a compatible Vulkan loader (1.4.304 or later), Proton uses loader settings to
+place Steam's overlay before the Wineland surface translator. Other enabled
+layers follow the translator and keep their normal activation rules. This also
+supports distribution-specific overlay names without special handling for each
+overlay.
+
+The settings stay inside the game's compatibility directory. They are exposed
+only to that launch and its child processes through `XDG_CONFIG_DIRS`. Existing
+user Vulkan loader settings are not replaced. Proton checks runtime support at
+startup. If private ordering cannot be verified, it logs the reason and disables
+the Steam overlay bridge for that launch, including the optional OpenGL adapter.
+Normal Wayland presentation and other overlays keep their existing settings.
+Wine also verifies the order in each native process architecture and disables
+the Vulkan bridge if verification fails. There is no per-frame checking.
+
+
 How is the initial monitor selected?
 ------------------------------------
 
