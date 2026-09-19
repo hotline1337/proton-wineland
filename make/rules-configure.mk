@@ -16,7 +16,8 @@ $$($(2)_SRC)/configure: $$($(2)_ORIGIN)/configure.ac | $$(OBJ)/.$(1)-post-source
 	cd "$$($(2)_SRC)" && autoreconf -fiv
 endif
 
-$$(OBJ)/.$(1)-$(3)-configure: $$($(2)_CONFIGURE_DEPS)
+# Regenerate configuration and component lists after syncing source changes.
+$$(OBJ)/.$(1)-$(3)-configure: $$(OBJ)/.$(1)-post-source $$($(2)_CONFIGURE_DEPS)
 	@echo ":: configuring $(1)-$(3)..." >&2
 
 	cd "$$($(2)_$(3)_OBJ)" && env $$($(2)_$(3)_ENV) \
