@@ -1,0 +1,409 @@
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Subject: [PATCH] upscalers: Keep only the required DLSSG alias.
+
+Keep the shared DLSS libraries in umu and provide only the Streamline
+nvngx_dlssg.dll alias required by OptiScaler's hardcoded early load.
+Other DLSS paths already use the configured NvngxFeaturePath.
+
+Retire the five redundant installer aliases before checking versions or
+downloading updates. Preserve user replacements and untracked files.
+Reuse the transactional installer to roll back failed tracking updates.
+
+Test fresh installs, offline migration, user overrides, rollback and
+migration of a complete prefix from six DLSS aliases to one.
+---
+ optiscaler_nightly.py               |  22 ++++
+ optiscaler_streamline.py            |  17 ++-
+ tests/test_optiscaler.py            |  96 +++++++++++++-
+ tests/test_optiscaler_streamline.py | 143 ++++++++++++++++++++-
+ upscalers.py                        |  12 +-
+ 5 files changed, 267 insertions(+), 23 deletions(-)
+
+diff --git a/optiscaler_nightly.py b/optiscaler_nightly.py
+index 75dd567..8453e81 100644
+--- a/optiscaler_nightly.py
++++ b/optiscaler_nightly.py
+@@ -305,6 +305,28 @@ def prepare_stable(archive, hashes, stage):
+     return files
+ 
+ 
++def prune_symlinks(destination, records, links, commit):
++    """Retire known installer aliases, preserving files or links users replaced."""
++    destination = Path(destination)
++    remaining = dict(records)
++    removed = []
++    for name, link in links.items():
++        record = records.get(name, {})
++        # Main-package aliases used a null checksum. Streamline records the link.
++        if not (record.get('symlink') == link or
++                ('md5_hash' in record and record['md5_hash'] is None
++                 and is_nightly(record.get('version', '')))):
++            continue
++        target = destination / name
++        if target.is_symlink() and os.readlink(target) == link:
++            removed.append(name)
++        # Stop owning user replacements as well, so a later update preserves them.
++        del remaining[name]
++    if remaining != records:
++        install(destination, destination, removed, (), lambda: commit(remaining))
++    return remaining
++
++
+ def install(stage, destination, old_names, new_names, commit):
+     """Replace owned files with rollback on failure, including metadata failure."""
+     stage, destination = Path(stage), Path(destination)
+diff --git a/optiscaler_streamline.py b/optiscaler_streamline.py
+index 602260e..ba6b89a 100644
+--- a/optiscaler_streamline.py
++++ b/optiscaler_streamline.py
+@@ -95,12 +95,12 @@ def prepare(item, cache, stage, destination):
+         raise ValueError('Incomplete Streamline runtime')
+     if not any(name.startswith(f'{ROOT}/Licenses/') for name in files):
+         raise ValueError('Streamline SDK contains no licence notices')
+-    for name in DLSS:
+-        if (Path(destination) / name).is_file():
+-            relative = f'{ROOT}/{name}'
+-            link = '../../' + name
+-            (Path(stage) / relative).symlink_to(link)
+-            files[relative] = {'symlink': link}
++    # Only this early load has a hardcoded path. The other DLSS libraries use
++    # the configured NvngxFeaturePath pointing at the shared umu directory.
++    relative = f'{ROOT}/nvngx_dlssg.dll'
++    link = '../../nvngx_dlssg.dll'
++    (Path(stage) / relative).symlink_to(link)
++    files[relative] = {'symlink': link}
+     return {name: {**record, 'version': item['version'], 'archive_sha256': item['sha256']}
+             for name, record in files.items()}
+ 
+@@ -108,9 +108,6 @@ def prepare(item, cache, stage, destination):
+ def current(item, destination, records):
+     if any(f'{ROOT}/{name}' not in records for name in REQUIRED + ('nvngx_dlssg.dll',)):
+         return False
+-    for name in DLSS:
+-        if (Path(destination) / name).is_file() != (f'{ROOT}/{name}' in records):
+-            return False
+     for name, record in records.items():
+         path = Path(destination) / name
+         if (record['version'] != item['version'] or record['archive_sha256'] != item['sha256']
+@@ -131,6 +128,8 @@ def setup(cache, destination, records, commit):
+             nightly.safe_name(name)
+             if not name.startswith(ROOT + '/'):
+                 raise ValueError('Invalid Streamline tracking path')
++        links = {f'{ROOT}/{name}': '../../' + name for name in DLSS if name != 'nvngx_dlssg.dll'}
++        records = nightly.prune_symlinks(destination, records, links, commit)
+         item = resolve(cache)
+         if current(item, destination, records):
+             return
+diff --git a/tests/test_optiscaler.py b/tests/test_optiscaler.py
+index fc8b57b..f4f3b86 100644
+--- a/tests/test_optiscaler.py
++++ b/tests/test_optiscaler.py
+@@ -81,20 +81,110 @@ class OptiscalerTests(unittest.TestCase):
+ 
+     def snapshot(self):
+         return {str(path.relative_to(self.compat)): (os.readlink(path) if path.is_symlink()
+-                else path.read_bytes()) for path in self.compat.rglob('*') if path.is_file()}
++                else path.read_bytes()) for path in self.compat.rglob('*')
++                if path.is_file() or path.is_symlink()}
+ 
+     def test_install_preserves_separately_managed_dlls(self):
+         (self.destination / 'libxess.dll').write_bytes(b'managed XeSS')
+-        (self.destination / 'nvngx_dlssd.dll').write_bytes(b'managed DLSS RR')
++        dlls = ('nvngx_dlss.dll', 'nvngx_dlssd.dll', 'nvngx_dlssg.dll')
++        for dll in dlls:
++            (self.destination / dll).write_bytes(b'managed ' + dll.encode())
+         (self.compat / 'upscaler_files').write_text(json.dumps({'xess_files': {'keep': 1}}))
+         self.installed()
+         self.assertEqual((self.destination / 'libxess.dll').read_bytes(), b'managed XeSS')
+         self.assertEqual((self.destination / 'OptiScaler/libxess.dll').read_bytes(), b'private XeSS')
+-        self.assertEqual(os.readlink(self.destination / 'OptiScaler/nvngx_dlssd.dll'), '../nvngx_dlssd.dll')
++        for dll in dlls:
++            self.assertFalse(os.path.lexists(self.destination / 'OptiScaler' / dll))
++            self.assertEqual((self.destination / dll).read_bytes(), b'managed ' + dll.encode())
+         self.assertEqual(json.loads((self.compat / 'upscaler_files').read_text())['xess_files'], {'keep': 1})
+         for alias in nightly.ALIASES:
+             self.assertEqual(os.readlink(self.destination / alias), 'OptiScaler.dll')
+ 
++    def legacy_dlss_links(self):
++        self.installed()
++        tracking = self.compat / 'upscaler_files'
++        records = json.loads(tracking.read_text())
++        names = []
++        for dll in ('nvngx_dlss.dll', 'nvngx_dlssd.dll', 'nvngx_dlssg.dll'):
++            (self.destination / dll).write_bytes(b'managed ' + dll.encode())
++            name = f'{nightly.ROOT}/OptiScaler/{dll}'
++            (self.prefix / name).symlink_to('../' + dll)
++            records['opti_files'][name] = {
++                'version': self.version, 'md5_hash': None,
++                'archive_sha256': self.item['sha256'],
++            }
++            names.append(name)
++        tracking.write_text(json.dumps(records))
++        return names
++
++    def test_legacy_dlss_links_are_pruned_without_reinstalling(self):
++        names = self.legacy_dlss_links()
++        ini = self.destination / 'OptiScaler.ini'
++        ini.write_bytes(ini.read_bytes() + b'\n; user setting stays\n')
++        before_ini = ini.read_bytes()
++        with mock.patch.object(nightly, 'resolve', return_value=self.item), \
++                mock.patch.object(nightly, 'prepare') as prepare:
++            self.assertTrue(self.setup())
++            before = self.snapshot()
++            self.assertTrue(self.setup())
++        prepare.assert_not_called()
++        self.assertEqual(before, self.snapshot())
++        for name in names:
++            self.assertFalse(os.path.lexists(self.prefix / name))
++            self.assertNotIn(name, json.loads((self.compat / 'upscaler_files').read_text())['opti_files'])
++        self.assertEqual(ini.read_bytes(), before_ini)
++        for alias in nightly.ALIASES:
++            self.assertEqual(os.readlink(self.destination / alias), 'OptiScaler.dll')
++
++    def test_legacy_dlss_cleanup_works_offline_with_broken_links(self):
++        names = self.legacy_dlss_links()
++        (self.destination / 'nvngx_dlssd.dll').unlink()
++        with mock.patch.object(nightly, 'resolve', side_effect=OSError('offline')):
++            self.assertTrue(self.setup())
++        for name in names:
++            self.assertFalse(os.path.lexists(self.prefix / name))
++
++    def test_legacy_dlss_cleanup_preserves_and_disowns_user_replacements(self):
++        names = self.legacy_dlss_links()
++        regular, link, untracked = [self.prefix / name for name in names]
++        regular.unlink()
++        regular.write_bytes(b'user DLL')
++        link.unlink()
++        link.symlink_to('../nvngx_dlss.dll')
++        tracking = self.compat / 'upscaler_files'
++        records = json.loads(tracking.read_text())
++        del records['opti_files'][names[2]]
++        tracking.write_text(json.dumps(records))
++        self.installed()
++        # A subsequent package update must not take ownership back or delete them.
++        self.item = {**self.item, 'version': 'nightly-20260907'}
++        self.installed()
++        self.assertEqual(regular.read_bytes(), b'user DLL')
++        self.assertEqual(os.readlink(link), '../nvngx_dlss.dll')
++        self.assertEqual(os.readlink(untracked), '../nvngx_dlssg.dll')
++        for name in names:
++            self.assertNotIn(name, json.loads(tracking.read_text())['opti_files'])
++
++    def test_legacy_dlss_cleanup_does_not_prune_hashed_package_files(self):
++        names = self.legacy_dlss_links()
++        target = self.prefix / names[0]
++        target.unlink()
++        self.dependency_files('opti_files', {'OptiScaler/nvngx_dlss.dll': b'bundled DLL'})
++        tracking = self.compat / 'upscaler_files'
++        records = json.loads(tracking.read_text())
++        records['opti_files'][names[0]]['archive_sha256'] = self.item['sha256']
++        tracking.write_text(json.dumps(records))
++        self.installed()
++        self.assertEqual(target.read_bytes(), b'bundled DLL')
++        self.assertIn(names[0], json.loads((self.compat / 'upscaler_files').read_text())['opti_files'])
++
++    def test_legacy_dlss_cleanup_rolls_back_when_tracking_write_fails(self):
++        self.legacy_dlss_links()
++        before = self.snapshot()
++        with mock.patch.object(upscalers, '__set_tracked_items', side_effect=OSError('disk full')):
++            self.assertTrue(self.setup())
++        self.assertEqual(self.snapshot(), before)
++
+     def dependency_files(self, section, files):
+         tracking = self.compat / 'upscaler_files'
+         records = json.loads(tracking.read_text()) if tracking.exists() else {}
+diff --git a/tests/test_optiscaler_streamline.py b/tests/test_optiscaler_streamline.py
+index 7dd9fc8..531608a 100644
+--- a/tests/test_optiscaler_streamline.py
++++ b/tests/test_optiscaler_streamline.py
+@@ -11,7 +11,7 @@ import zipfile
+ from pathlib import Path
+ from unittest import mock
+ 
+-from test_optiscaler import nightly, upscalers
++from test_optiscaler import INI, configuration, nightly, upscalers
+ 
+ 
+ streamline = upscalers.streamline
+@@ -77,13 +77,148 @@ class StreamlineTests(unittest.TestCase):
+                 self.assertTrue(streamline.current(self.item, self.destination, self.records))
+                 for name in streamline.DLSS:
+                     dll = self.destination / streamline.ROOT / name
+-                    self.assertEqual(os.readlink(dll), '../../' + name)
+-                    self.assertEqual(dll.read_bytes(), b'managed ' + name.encode())
+-                self.assertEqual(len(self.records), 6 + 3 + 2)
++                    if name == 'nvngx_dlssg.dll':
++                        self.assertEqual(os.readlink(dll), '../../' + name)
++                        self.assertEqual(dll.read_bytes(), b'managed ' + name.encode())
++                    else:
++                        self.assertFalse(os.path.lexists(dll))
++                    self.assertEqual((self.destination / name).read_bytes(), b'managed ' + name.encode())
++                self.assertEqual(len(self.records), 6 + 1 + 2)
+                 self.assertEqual((self.destination / streamline.ROOT / 'Licenses/license.txt').read_bytes(),
+                                  b'SDK license')
+                 self.assertFalse((self.destination / streamline.ROOT / 'development').exists())
+ 
++    def legacy_dlss_links(self):
++        archive = self.archive()
++        self.setup(archive)
++        for dll in ('nvngx_dlss.dll', 'nvngx_dlssd.dll'):
++            name = f'{streamline.ROOT}/{dll}'
++            link = '../../' + dll
++            (self.destination / name).symlink_to(link)
++            self.records[name] = {'symlink': link, 'version': self.item['version'],
++                                  'archive_sha256': self.item['sha256']}
++        return archive
++
++    def test_legacy_links_are_pruned_without_runtime_download(self):
++        self.legacy_dlss_links()
++        with mock.patch.object(streamline, 'resolve', return_value=self.item), \
++                mock.patch.object(nightly, 'verified_download') as download:
++            streamline.setup(self.cache, self.destination, self.records, self.commit)
++            before, records = self.snapshot(), self.records.copy()
++            streamline.setup(self.cache, self.destination, self.records, self.commit)
++        download.assert_not_called()
++        self.assertEqual(self.snapshot(), before)
++        self.assertEqual(self.records, records)
++        for dll in ('nvngx_dlss.dll', 'nvngx_dlssd.dll'):
++            self.assertNotIn(f'{streamline.ROOT}/{dll}', self.records)
++            self.assertFalse(os.path.lexists(self.destination / streamline.ROOT / dll))
++            self.assertEqual((self.destination / dll).read_bytes(), b'managed ' + dll.encode())
++        self.assertTrue(streamline.current(self.item, self.destination, self.records))
++
++    def test_legacy_cleanup_works_offline_and_preserves_required_link(self):
++        self.legacy_dlss_links()
++        (self.destination / 'nvngx_dlssd.dll').unlink()
++        with mock.patch.object(streamline, 'resolve', side_effect=OSError('offline')):
++            streamline.setup(self.cache, self.destination, self.records, self.commit)
++        for dll in ('nvngx_dlss.dll', 'nvngx_dlssd.dll'):
++            self.assertFalse(os.path.lexists(self.destination / streamline.ROOT / dll))
++        self.assertTrue(streamline.current(self.item, self.destination, self.records))
++
++    def test_optional_shared_dlss_files_do_not_require_links_or_reinstall(self):
++        self.setup(self.archive())
++        for dll in ('nvngx_dlss.dll', 'nvngx_dlssd.dll'):
++            (self.destination / dll).unlink()
++        self.assertTrue(streamline.current(self.item, self.destination, self.records))
++
++    def test_legacy_cleanup_preserves_user_replacements_across_updates(self):
++        self.legacy_dlss_links()
++        regular = self.destination / streamline.ROOT / 'nvngx_dlss.dll'
++        link = self.destination / streamline.ROOT / 'nvngx_dlssd.dll'
++        regular.unlink()
++        regular.write_bytes(b'user DLL')
++        link.unlink()
++        link.symlink_to('../../nvngx_dlssg.dll')
++        self.setup(self.archive())
++        self.setup(self.archive(extra=[('bin/x64/sl.new.dll', b'new')]))
++        self.assertEqual(regular.read_bytes(), b'user DLL')
++        self.assertEqual(os.readlink(link), '../../nvngx_dlssg.dll')
++        for dll in ('nvngx_dlss.dll', 'nvngx_dlssd.dll'):
++            self.assertNotIn(f'{streamline.ROOT}/{dll}', self.records)
++
++    def test_legacy_cleanup_preserves_untracked_links(self):
++        archive = self.legacy_dlss_links()
++        for dll in ('nvngx_dlss.dll', 'nvngx_dlssd.dll'):
++            del self.records[f'{streamline.ROOT}/{dll}']
++        before = self.snapshot()
++        self.setup(archive)
++        self.assertEqual(self.snapshot(), before)
++
++    def test_legacy_cleanup_rolls_back_when_tracking_write_fails(self):
++        self.legacy_dlss_links()
++        before, records = self.snapshot(), self.records.copy()
++        streamline.setup(self.cache, self.destination, self.records,
++                         mock.Mock(side_effect=OSError('disk full')))
++        self.assertEqual(self.snapshot(), before)
++        self.assertEqual(self.records, records)
++
++    def test_legacy_cleanup_cannot_delete_through_parent_symlink(self):
++        self.legacy_dlss_links()
++        folder = self.destination / streamline.ROOT
++        outside = self.root / 'outside'
++        folder.rename(outside)
++        folder.symlink_to(outside)
++        before, records = self.snapshot(), self.records.copy()
++        streamline.setup(self.cache, self.destination, self.records, self.commit)
++        self.assertEqual(self.snapshot(), before)
++        self.assertEqual(self.records, records)
++        self.assertEqual(os.readlink(outside / 'nvngx_dlss.dll'), '../../nvngx_dlss.dll')
++
++    def test_full_prefix_migrates_six_links_to_one_without_downloads(self):
++        prefix = self.root / 'pfx'
++        self.destination = prefix / nightly.ROOT
++        self.destination.mkdir(parents=True)
++        for dll in streamline.DLSS:
++            (self.destination / dll).write_bytes(b'managed ' + dll.encode())
++        self.legacy_dlss_links()
++
++        opti = {}
++        for name, data in {'OptiScaler.dll': b'OptiScaler', 'OptiScaler.ini': INI}.items():
++            (self.destination / name).write_bytes(data)
++            opti[f'{nightly.ROOT}/{name}'] = {
++                'version': 'nightly-20260906',
++                'md5_hash': None if name.endswith('.ini') else hashlib.md5(data).hexdigest(),
++            }
++        for name in nightly.ALIASES:
++            (self.destination / name).symlink_to('OptiScaler.dll')
++            opti[f'{nightly.ROOT}/{name}'] = dict(opti[f'{nightly.ROOT}/OptiScaler.dll'])
++        for dll in streamline.DLSS:
++            name = f'OptiScaler/{dll}'
++            (self.destination / name).symlink_to('../' + dll)
++            opti[f'{nightly.ROOT}/{name}'] = {'version': 'nightly-20260906', 'md5_hash': None}
++        tracking = self.root / 'upscaler_files'
++        tracking.write_text(json.dumps({'opti_files': opti, 'opti_streamline_files': self.records,
++                                        'dlss_files': {'separately managed': True}}))
++        configuration.config.path.cache_dir = self.cache
++        with mock.patch.object(nightly, 'resolve', side_effect=OSError('offline')), \
++                mock.patch.object(streamline, 'resolve', return_value=self.item), \
++                mock.patch.object(nightly, 'verified_download') as download, \
++                mock.patch.object(nightly, 'prepare') as prepare:
++            self.assertTrue(upscalers.setup_optiscaler({}, self.root, prefix, 'nightly'))
++        download.assert_not_called()
++        prepare.assert_not_called()
++        links = {str(path.relative_to(self.destination)): os.readlink(path)
++                 for path in (self.destination / 'OptiScaler').rglob('*') if path.is_symlink()}
++        self.assertEqual(links, {f'{streamline.ROOT}/nvngx_dlssg.dll': '../../nvngx_dlssg.dll'})
++        records = json.loads(tracking.read_text())
++        self.assertEqual(records['dlss_files'], {'separately managed': True})
++        self.assertTrue(streamline.current(self.item, self.destination, records['opti_streamline_files']))
++        self.assertTrue(upscalers.check_optiscaler(self.root, prefix, ignore_version=True))
++        self.assertEqual((self.destination / 'OptiScaler.ini').read_bytes(), INI)
++        for dll in streamline.DLSS:
++            self.assertEqual((self.destination / dll).read_bytes(), b'managed ' + dll.encode())
++        for name in nightly.ALIASES:
++            self.assertEqual(os.readlink(self.destination / name), 'OptiScaler.dll')
++
+     def test_current_install_needs_no_download(self):
+         self.setup(self.archive())
+         with mock.patch.object(streamline, 'resolve', return_value=self.item), \
+diff --git a/upscalers.py b/upscalers.py
+index 54007a6..1c73cbd 100644
+--- a/upscalers.py
++++ b/upscalers.py
+@@ -476,6 +476,11 @@ def download_optiscaler(
+         tracked_items = {}
+ 
+     try:
++        links = {f'{nightly.ROOT}/OptiScaler/{name}': '../' + name
++                 for name in ('nvngx_dlss.dll', 'nvngx_dlssd.dll', 'nvngx_dlssg.dll')}
++        tracked_items = nightly.prune_symlinks(
++            prefix_dir, tracked_items, links,
++            lambda records: __set_tracked_items(compat_dir, __opti_section, records))
+         cache_dir = config.path.cache_dir.joinpath('upscalers')
+         item = (nightly.resolve(version, cache_dir) if nightly.is_nightly(version)
+                 else __get_opti_files(version)[1])
+@@ -489,13 +494,6 @@ def download_optiscaler(
+             stage = Path(tmp)
+             if nightly.is_nightly(version):
+                 hashes = nightly.prepare(item, cache_dir, stage)
+-                # Let the nightly discover managed DLSS/RR/FG without owning copies.
+-                for name in ('nvngx_dlss.dll', 'nvngx_dlssd.dll', 'nvngx_dlssg.dll'):
+-                    alias = 'OptiScaler/' + name
+-                    if (destination / name).is_file() and alias not in hashes:
+-                        (stage / 'OptiScaler').mkdir(exist_ok=True)
+-                        (stage / alias).symlink_to('../' + name)
+-                        hashes[alias] = None
+             else:
+                 cached_file = cache_dir / Path(unquote(urlparse(item['download_url']).path)).name
+                 __cached_download(item, cached_file)
