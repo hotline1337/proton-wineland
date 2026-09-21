@@ -219,6 +219,10 @@ This extends the existing DXVK HUD, which VKD3D Proton also uses for Direct3D
 threads when requested. Available readings depend on hardware, drivers, and
 permissions.
 
+The same HUD is available with `PROTON_DXVK_LOWLATENCY=1`. Its existing
+`renderlatency`, `jitter` and `latencydetails` items remain available alongside
+the Wineland HUD options. This does not add HUD support to `vkd3d-low-latency`.
+
 Append DXVK HUD options after the preset to customise it, for example:
 
 ```sh
