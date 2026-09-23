@@ -1,4 +1,4 @@
-From 49f0a59d4703d643df803f50d438795fd144cf76 Mon Sep 17 00:00:00 2001
+From f0cb2866416a9e7e4b29e317f257ab5556def39a Mon Sep 17 00:00:00 2001
 From: Erhan Bilgili <erhan.bilgili@gmail.com>
 Date: Mon, 21 Sep 2026 12:48:43 +0200
 Subject: [PATCH] [hud] Port Wineland HUD features to DXVK Low Latency
@@ -169,10 +169,10 @@ index 35d56c0b..81c12a09 100644
 +FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM
 +OTHER DEALINGS IN THE FONT SOFTWARE.
 diff --git a/README.md b/README.md
-index 07f10228..8d8ea023 100644
+index 2c273f8d..c47375c8 100644
 --- a/README.md
 +++ b/README.md
-@@ -198,7 +198,77 @@ Manipulation of Direct3D libraries in multi-player games may be considered cheat
+@@ -199,7 +199,77 @@ Manipulation of Direct3D libraries in multi-player games may be considered cheat
  ### HUD
  The `DXVK_HUD` environment variable controls a HUD which can display the framerate and some stat counters. It accepts a comma-separated list of the following options:
  - `devinfo`: Displays the name of the GPU and the driver version.
@@ -251,7 +251,7 @@ index 07f10228..8d8ea023 100644
  - `frametimes`: Shows a frame time graph.
  - `submissions`: Shows the number of command buffers submitted per frame.
  - `drawcalls`: Shows the number of draw calls and render passes per frame.
-@@ -206,7 +276,7 @@ The `DXVK_HUD` environment variable controls a HUD which can display the framera
+@@ -207,7 +277,7 @@ The `DXVK_HUD` environment variable controls a HUD which can display the framera
  - `descriptors`: Shows the number of descriptor pools and descriptor sets.
  - `memory`: Shows the amount of device memory allocated and used.
  - `allocations`: Shows detailed memory chunk suballocation info.
@@ -260,7 +260,7 @@ index 07f10228..8d8ea023 100644
  - `version`: Shows DXVK version.
  - `api`: Shows the D3D feature level used by the application.
  - `cs`: Shows worker thread statistics.
-@@ -215,8 +285,170 @@ The `DXVK_HUD` environment variable controls a HUD which can display the framera
+@@ -216,8 +286,170 @@ The `DXVK_HUD` environment variable controls a HUD which can display the framera
  - `swvp`: Shows the vertex processing mode and the current number of software vertex processing shaders *[D3D9 Only]*
  - `scale=x`: Scales the HUD by a factor of `x` (e.g. `1.5`)
  - `opacity=y`: Adjusts the HUD opacity by a factor of `y` (e.g. `0.5`, `1.0` being fully opaque).
@@ -570,7 +570,7 @@ index 054792fb..2c1685e9 100644
      if (hud) {
        hud->addItem<hud::HudClientApiItem>("api", 1, GetApiName());
 diff --git a/src/d3d9/d3d9_swapchain.cpp b/src/d3d9/d3d9_swapchain.cpp
-index 1a8e7543..a017a49c 100644
+index 149f0847..296403e3 100644
 --- a/src/d3d9/d3d9_swapchain.cpp
 +++ b/src/d3d9/d3d9_swapchain.cpp
 @@ -889,6 +889,7 @@ namespace dxvk {
@@ -592,7 +592,7 @@ index 1a8e7543..a017a49c 100644
          // Blit back buffer onto Vulkan swap chain
          auto contextObjects = ctx->beginExternalRendering();
  
-@@ -1096,6 +1101,7 @@ namespace dxvk {
+@@ -1098,6 +1103,7 @@ namespace dxvk {
  
    void D3D9SwapChainEx::CreateBlitter() {
      Rc<hud::Hud> hud = hud::Hud::createHud(m_device);
@@ -1287,7 +1287,7 @@ index 207f47c3..b9d626cc 100644
      /// or FIFO_RELAXED (if false) present mode
      Tristate tearFree = Tristate::Auto;
 diff --git a/src/dxvk/dxvk_presenter.cpp b/src/dxvk/dxvk_presenter.cpp
-index bdf31570..ac7f448e 100644
+index 1a1a58c2..39467e51 100644
 --- a/src/dxvk/dxvk_presenter.cpp
 +++ b/src/dxvk/dxvk_presenter.cpp
 @@ -1,4 +1,5 @@
@@ -1391,8 +1391,8 @@ index bdf31570..ac7f448e 100644
 +    }
  
      uint64_t frameDeadline = 0u;
- 
-@@ -210,10 +293,14 @@ namespace dxvk {
+     if (Rc<FramePacer> p = m_framePacer; p && p->getMode() == FramePacerMode::LOW_LATENCY_VRR_PRESENT_TIMING)
+@@ -212,10 +295,14 @@ namespace dxvk {
      bool waitForPresent = m_hasPresentWait && isFifoMode;
  
      VkPresentTimingInfoEXT timingInfo = { VK_STRUCTURE_TYPE_PRESENT_TIMING_INFO_EXT };
@@ -1409,7 +1409,7 @@ index bdf31570..ac7f448e 100644
        std::lock_guard lock(m_timingMutex);
  
        if (m_timingMode.relativeTiming) {
-@@ -277,6 +364,11 @@ namespace dxvk {
+@@ -279,6 +366,11 @@ namespace dxvk {
      VkResult status = m_vkd->vkQueuePresentKHR(
        m_device->queues().graphics.queueHandle, &info);
  
@@ -1421,7 +1421,7 @@ index bdf31570..ac7f448e 100644
      // Treat a QUEUE_FULL error as a hint to recreate the swapchain with
      // a larger queue size. This could probably be done more robustly,
      // but since we have latency constraints in the frontend APIs, we
-@@ -298,6 +390,7 @@ namespace dxvk {
+@@ -300,6 +392,7 @@ namespace dxvk {
      }
  
      if (status >= 0) {
@@ -1429,7 +1429,7 @@ index bdf31570..ac7f448e 100644
        m_acquireStatus = VK_NOT_READY;
  
        m_frameIndex += 1;
-@@ -527,6 +620,50 @@ namespace dxvk {
+@@ -529,6 +622,50 @@ namespace dxvk {
    }
  
  
@@ -1480,7 +1480,7 @@ index bdf31570..ac7f448e 100644
    void Presenter::setSyncInterval(uint32_t syncInterval) {
      std::lock_guard lock(m_surfaceMutex);
  
-@@ -683,6 +820,26 @@ namespace dxvk {
+@@ -685,6 +822,26 @@ namespace dxvk {
        return status;
      }
  
@@ -1507,7 +1507,7 @@ index bdf31570..ac7f448e 100644
      // Select image extent based on current surface capabilities, and return
      // immediately if we cannot create an actual swap chain.
      VkExtent2D imageExtent = pickImageExtent(caps.surfaceCapabilities, m_preferredExtent);
-@@ -992,7 +1149,12 @@ namespace dxvk {
+@@ -997,7 +1154,12 @@ namespace dxvk {
  
      // Set up initial present timing state
      if (m_timingMode.presentStage) {
@@ -1521,7 +1521,7 @@ index bdf31570..ac7f448e 100644
  
        updateDisplayTiming();
  
-@@ -1371,6 +1533,7 @@ namespace dxvk {
+@@ -1376,6 +1538,7 @@ namespace dxvk {
          auto& domain = info.domains.emplace_back();
          domain.timeDomain = domains[i];
          domain.timeDomainId = domainIds[i];
@@ -1529,7 +1529,7 @@ index bdf31570..ac7f448e 100644
  
          m_timingMode.timeDomainId = domainIds[i];
        }
-@@ -1534,13 +1697,21 @@ namespace dxvk {
+@@ -1548,13 +1711,21 @@ namespace dxvk {
          swapchainInfo[i].timeDomainId = domains[i].timeDomainId;
  
          if (domains[i].timeDomain == VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT)
@@ -1553,7 +1553,7 @@ index bdf31570..ac7f448e 100644
      constexpr uint32_t MaxAttempts = 5u;
      constexpr uint64_t MaxDeviation = 1500000u;
  
-@@ -1550,21 +1721,78 @@ namespace dxvk {
+@@ -1564,21 +1735,78 @@ namespace dxvk {
        VkResult status = m_vkd->vkGetCalibratedTimestampsKHR(m_vkd->device(),
          domains.size(), calibrationInfo.data(), timestamps.data(), &maxDeviation);
  
@@ -1640,7 +1640,7 @@ index bdf31570..ac7f448e 100644
    }
  
  
-@@ -1582,7 +1810,7 @@ namespace dxvk {
+@@ -1596,7 +1824,7 @@ namespace dxvk {
      }
  
      // Still need to drain the queue even if everything is messed up
@@ -1649,7 +1649,7 @@ index bdf31570..ac7f448e 100644
      small_vector<VkPastPresentationTimingEXT, FrameQueueSize> reports;
  
      stageTimes.resize(m_timingQueueSize);
-@@ -1590,8 +1818,8 @@ namespace dxvk {
+@@ -1604,8 +1832,8 @@ namespace dxvk {
  
      for (size_t i = 0u; i < m_timingQueueSize; i++) {
        reports[i].sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_EXT;
@@ -1660,7 +1660,7 @@ index bdf31570..ac7f448e 100644
      }
  
      VkPastPresentationTimingInfoEXT timingInfo = { VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_INFO_EXT };
-@@ -1604,7 +1832,7 @@ namespace dxvk {
+@@ -1618,7 +1846,7 @@ namespace dxvk {
      VkResult status = m_vkd->vkGetPastPresentationTimingEXT(m_vkd->device(),
        &timingInfo, &timingProperties);
  
@@ -1669,7 +1669,7 @@ index bdf31570..ac7f448e 100644
        Logger::warn(str::format("Presenter: Failed to query past present timings: ", status));
        commitTimingFeedback(feedback);
        return false;
-@@ -1635,8 +1863,14 @@ namespace dxvk {
+@@ -1649,8 +1877,14 @@ namespace dxvk {
      bool hasMissedDeadline = false;
  
      for (size_t i = 0u; i < timingProperties.presentationTimingCount; i++) {
@@ -1685,7 +1685,7 @@ index bdf31570..ac7f448e 100644
  
        if (!report.reportComplete || !time.time || time.stage != m_timingMode.presentStage)
          continue;
-@@ -1740,10 +1974,17 @@ namespace dxvk {
+@@ -1757,10 +1991,17 @@ namespace dxvk {
      if (srcTimeDomain == dstTimeDomain && srcTimeDomainId == dstTimeDomainId)
        return srcTimestamp;
  
@@ -1705,7 +1705,7 @@ index bdf31570..ac7f448e 100644
      // Determine tick frequency for QPC timestamps. Our internal high resolution
      // clock is QPC on Windows, so this should work whenever the time domain is
      // actually present.
-@@ -1755,94 +1996,6 @@ namespace dxvk {
+@@ -1772,94 +2013,6 @@ namespace dxvk {
        s_qpcFreq.store(qpcFreq, std::memory_order_relaxed);
      }
  
@@ -1800,7 +1800,7 @@ index bdf31570..ac7f448e 100644
      // Compute time delta in terms of the destination time domain
      int64_t timeDelta = int64_t(srcTimestamp - refTimeSrcDomain);
  
-@@ -1884,6 +2037,158 @@ namespace dxvk {
+@@ -1901,6 +2054,158 @@ namespace dxvk {
    }
  
  
@@ -1959,7 +1959,7 @@ index bdf31570..ac7f448e 100644
    void Presenter::destroySwapchain() {
      // Without present fence support, waiting for the queue or device to go idle
      // is the only way to properly synchronize swapchain teardown. Care must be
-@@ -1917,6 +2222,7 @@ namespace dxvk {
+@@ -1937,6 +2242,7 @@ namespace dxvk {
      m_dynamicModes.clear();
  
      m_swapchain = VK_NULL_HANDLE;
@@ -1967,7 +1967,7 @@ index bdf31570..ac7f448e 100644
      m_acquireStatus = VK_NOT_READY;
  
      m_presentPending = false;
-@@ -1934,6 +2240,19 @@ namespace dxvk {
+@@ -1954,6 +2260,19 @@ namespace dxvk {
      m_timingDomains = std::nullopt;
      m_timingDisplayInfo = std::nullopt;
      m_timingMode = PresenterTimingInfo();
@@ -1988,7 +1988,7 @@ index bdf31570..ac7f448e 100644
  
  
 diff --git a/src/dxvk/dxvk_presenter.h b/src/dxvk/dxvk_presenter.h
-index c630d938..2801ec44 100644
+index 4a5a104a..1ba3f1a8 100644
 --- a/src/dxvk/dxvk_presenter.h
 +++ b/src/dxvk/dxvk_presenter.h
 @@ -1,5 +1,6 @@
@@ -2092,7 +2092,7 @@ index c630d938..2801ec44 100644
  
      uint32_t                    m_imageIndex = 0;
      uint32_t                    m_frameIndex = 0;
-@@ -483,6 +543,10 @@ namespace dxvk {
+@@ -484,6 +544,10 @@ namespace dxvk {
  
      void recalibrateTimeDomains();
  
@@ -2100,10 +2100,10 @@ index c630d938..2801ec44 100644
 +            uint32_t                  count,
 +            PresenterTimeDomain*      domains);
 +
-     bool updatePresentTiming(uint64_t frameId);
+     bool updatePresentTiming(uint64_t frameId, FramePacer* pacer);
  
      void commitTimingFeedback(
-@@ -517,6 +581,17 @@ namespace dxvk {
+@@ -518,6 +582,17 @@ namespace dxvk {
  
      void runFrameThread();
  
@@ -10746,7 +10746,7 @@ index 6c193cc8..2949b4d9 100644
  
    gl_Position = vec4(scaled_pos, 0.0f, 1.0f);
 diff --git a/src/dxvk/meson.build b/src/dxvk/meson.build
-index f4aa53f7..cf9a4d8a 100644
+index 130be3f1..01febe69 100644
 --- a/src/dxvk/meson.build
 +++ b/src/dxvk/meson.build
 @@ -86,6 +86,8 @@ dxvk_src = [
@@ -10758,7 +10758,7 @@ index f4aa53f7..cf9a4d8a 100644
    'hud/dxvk_hud_item.cpp',
    'hud/dxvk_hud_item_latency.cpp',
    'hud/dxvk_hud_renderer.cpp',
-@@ -103,6 +105,9 @@ if platform == 'windows'
+@@ -104,6 +106,9 @@ if platform == 'windows'
  endif
  
  dxvk_extra_deps = [ dependency('threads') ]

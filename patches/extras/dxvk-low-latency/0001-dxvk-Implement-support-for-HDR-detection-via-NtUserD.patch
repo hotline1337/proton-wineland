@@ -1,4 +1,4 @@
-From 477c16a58ee49afbebf83a448eeb699f738b7253 Mon Sep 17 00:00:00 2001
+From 5e11341d4186c0c9b8e33bbd4e4f77b726230f38 Mon Sep 17 00:00:00 2001
 From: Etaash Mathamsetty
  <45927311+Etaash-mathamsetty@users.noreply.github.com>
 Date: Mon, 9 Mar 2026 02:29:09 -0500
@@ -25,7 +25,7 @@ Subject: [PATCH] [dxvk] Implement support for HDR detection via
  16 files changed, 135 insertions(+), 12 deletions(-)
 
 diff --git a/src/dxgi/dxgi_monitor.cpp b/src/dxgi/dxgi_monitor.cpp
-index 842fb3fc0..70c844442 100644
+index 842fb3fc..70c84444 100644
 --- a/src/dxgi/dxgi_monitor.cpp
 +++ b/src/dxgi/dxgi_monitor.cpp
 @@ -6,7 +6,6 @@ namespace dxvk {
@@ -44,7 +44,7 @@ index 842fb3fc0..70c844442 100644
 \ No newline at end of file
 +}
 diff --git a/src/dxgi/dxgi_monitor.h b/src/dxgi/dxgi_monitor.h
-index 3a31a23cb..3a492b516 100644
+index 3a31a23c..3a492b51 100644
 --- a/src/dxgi/dxgi_monitor.h
 +++ b/src/dxgi/dxgi_monitor.h
 @@ -96,4 +96,4 @@ namespace dxvk {
@@ -55,10 +55,10 @@ index 3a31a23cb..3a492b516 100644
 \ No newline at end of file
 +}
 diff --git a/src/dxgi/dxgi_options.cpp b/src/dxgi/dxgi_options.cpp
-index 333cb4f77..9b76c50e6 100644
+index d83342e2..60d5f091 100644
 --- a/src/dxgi/dxgi_options.cpp
 +++ b/src/dxgi/dxgi_options.cpp
-@@ -119,9 +119,16 @@ namespace dxvk {
+@@ -198,9 +198,16 @@ namespace dxvk {
      }
  
      this->enableHDR = config.getOption<bool>("dxgi.enableHDR", env::getEnvVar("DXVK_HDR") == "1");
@@ -76,10 +76,10 @@ index 333cb4f77..9b76c50e6 100644
        Logger::info("HDR was configured to be enabled, but has been force disabled as a UE4 DX11 game was detected.");
        this->enableHDR = false;
 diff --git a/src/dxgi/dxgi_options.h b/src/dxgi/dxgi_options.h
-index 464e4d27e..56671786d 100644
+index c61c574a..5a2f5c50 100644
 --- a/src/dxgi/dxgi_options.h
 +++ b/src/dxgi/dxgi_options.h
-@@ -46,6 +46,9 @@ namespace dxvk {
+@@ -55,6 +55,9 @@ namespace dxvk {
      /// Enable HDR
      bool enableHDR;
  
@@ -90,7 +90,7 @@ index 464e4d27e..56671786d 100644
      bool enableDummyCompositionSwapchain;
  
 diff --git a/src/dxgi/dxgi_output.cpp b/src/dxgi/dxgi_output.cpp
-index 8814f5cb0..bb0af102e 100644
+index 8814f5cb..bb0af102 100644
 --- a/src/dxgi/dxgi_output.cpp
 +++ b/src/dxgi/dxgi_output.cpp
 @@ -232,6 +232,9 @@ namespace dxvk {
@@ -143,11 +143,11 @@ index 8814f5cb0..bb0af102e 100644
      auto refreshPeriod = computeRefreshPeriod(
        activeWsiMode.refreshRate.numerator,
 diff --git a/src/dxgi/dxgi_swapchain.cpp b/src/dxgi/dxgi_swapchain.cpp
-index 0aa3fc701..1b70c67e2 100644
+index 71e69f98..fa2399cb 100644
 --- a/src/dxgi/dxgi_swapchain.cpp
 +++ b/src/dxgi/dxgi_swapchain.cpp
-@@ -45,6 +45,9 @@ namespace dxvk {
-     // Ensure that RGBA16 swap chains are scRGB if supported
+@@ -50,6 +50,9 @@ namespace dxvk {
+     UpdateSourceSize(m_desc.Width, m_desc.Height);
      UpdateColorSpace(m_desc.Format, m_colorSpace);
  
 +    const DxgiOptions* options = m_factory->GetOptions();
@@ -156,7 +156,7 @@ index 0aa3fc701..1b70c67e2 100644
      // Somewhat hacky way to determine whether to forward the
      // display refresh rate in windowed mode even with a sync
      // interval of 1.
-@@ -995,7 +998,10 @@ namespace dxvk {
+@@ -1028,7 +1031,10 @@ namespace dxvk {
  
      // Only expose HDR10 color space if HDR option is enabled
      if (ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
@@ -168,7 +168,7 @@ index 0aa3fc701..1b70c67e2 100644
  
      return false;
    }
-@@ -1021,8 +1027,13 @@ namespace dxvk {
+@@ -1054,8 +1060,13 @@ namespace dxvk {
  
      // If this was a colorspace other than our current one,
      // punt us into that one on the DXGI output.
@@ -184,10 +184,10 @@ index 0aa3fc701..1b70c67e2 100644
      return hr;
    }
 diff --git a/src/dxgi/dxgi_swapchain.h b/src/dxgi/dxgi_swapchain.h
-index 85857ac1c..10eaafc90 100644
+index c8da01d0..cf4ba411 100644
 --- a/src/dxgi/dxgi_swapchain.h
 +++ b/src/dxgi/dxgi_swapchain.h
-@@ -194,6 +194,7 @@ namespace dxvk {
+@@ -200,6 +200,7 @@ namespace dxvk {
      HMONITOR                        m_monitor;
      bool                            m_monitorHasOutput = true;
      bool                            m_frameStatisticsDisjoint = true;
@@ -196,7 +196,7 @@ index 85857ac1c..10eaafc90 100644
  
      double                          m_frameRateOption = 0.0;
 diff --git a/src/wsi/glfw/wsi_window_glfw.cpp b/src/wsi/glfw/wsi_window_glfw.cpp
-index 2674741b9..eb7158755 100644
+index 2674741b..eb715875 100644
 --- a/src/wsi/glfw/wsi_window_glfw.cpp
 +++ b/src/wsi/glfw/wsi_window_glfw.cpp
 @@ -169,6 +169,11 @@ namespace dxvk::wsi {
@@ -212,7 +212,7 @@ index 2674741b9..eb7158755 100644
  
  #endif
 diff --git a/src/wsi/sdl2/wsi_monitor_sdl2.cpp b/src/wsi/sdl2/wsi_monitor_sdl2.cpp
-index d021346f3..25b49f38c 100644
+index d021346f..25b49f38 100644
 --- a/src/wsi/sdl2/wsi_monitor_sdl2.cpp
 +++ b/src/wsi/sdl2/wsi_monitor_sdl2.cpp
 @@ -155,6 +155,11 @@ namespace dxvk::wsi {
@@ -228,7 +228,7 @@ index d021346f3..25b49f38c 100644
  
  #endif
 diff --git a/src/wsi/sdl3/wsi_monitor_sdl3.cpp b/src/wsi/sdl3/wsi_monitor_sdl3.cpp
-index f56884786..5a669d976 100644
+index f5688478..5a669d97 100644
 --- a/src/wsi/sdl3/wsi_monitor_sdl3.cpp
 +++ b/src/wsi/sdl3/wsi_monitor_sdl3.cpp
 @@ -152,6 +152,11 @@ namespace dxvk::wsi {
@@ -244,7 +244,7 @@ index f56884786..5a669d976 100644
  
  #endif
 diff --git a/src/wsi/win32/wsi_monitor_win32.cpp b/src/wsi/win32/wsi_monitor_win32.cpp
-index d791bf2c3..b6399c901 100644
+index d791bf2c..b6399c90 100644
 --- a/src/wsi/win32/wsi_monitor_win32.cpp
 +++ b/src/wsi/win32/wsi_monitor_win32.cpp
 @@ -223,6 +223,75 @@ namespace dxvk::wsi {
@@ -324,7 +324,7 @@ index d791bf2c3..b6399c901 100644
      // Get the device name of the monitor.
      MONITORINFOEXW monInfo;
 diff --git a/src/wsi/win32/wsi_platform_win32.h b/src/wsi/win32/wsi_platform_win32.h
-index 06b86619b..330b817b1 100644
+index 06b86619..330b817b 100644
 --- a/src/wsi/win32/wsi_platform_win32.h
 +++ b/src/wsi/win32/wsi_platform_win32.h
 @@ -44,6 +44,8 @@ namespace dxvk::wsi {
@@ -337,7 +337,7 @@ index 06b86619b..330b817b1 100644
  
      virtual void getWindowSize(
 diff --git a/src/wsi/wsi_edid.h b/src/wsi/wsi_edid.h
-index d1af3317a..7e248eed7 100644
+index d1af3317..7e248eed 100644
 --- a/src/wsi/wsi_edid.h
 +++ b/src/wsi/wsi_edid.h
 @@ -24,6 +24,8 @@ namespace dxvk::wsi {
@@ -350,7 +350,7 @@ index d1af3317a..7e248eed7 100644
  
    /**
 diff --git a/src/wsi/wsi_monitor.h b/src/wsi/wsi_monitor.h
-index 29cd9ef78..00232379c 100644
+index 29cd9ef7..00232379 100644
 --- a/src/wsi/wsi_monitor.h
 +++ b/src/wsi/wsi_monitor.h
 @@ -27,6 +27,7 @@ namespace dxvk::wsi {
@@ -369,7 +369,7 @@ index 29cd9ef78..00232379c 100644
 +
  }
 diff --git a/src/wsi/wsi_platform.cpp b/src/wsi/wsi_platform.cpp
-index 08f456e7b..96e875571 100644
+index 08f456e7..96e87557 100644
 --- a/src/wsi/wsi_platform.cpp
 +++ b/src/wsi/wsi_platform.cpp
 @@ -199,4 +199,8 @@ namespace dxvk::wsi {
@@ -382,7 +382,7 @@ index 08f456e7b..96e875571 100644
 +
  }
 diff --git a/src/wsi/wsi_platform.h b/src/wsi/wsi_platform.h
-index f1fae3f17..7da0cd7ae 100644
+index f1fae3f1..7da0cd7a 100644
 --- a/src/wsi/wsi_platform.h
 +++ b/src/wsi/wsi_platform.h
 @@ -44,6 +44,8 @@ namespace dxvk::wsi {
@@ -395,5 +395,5 @@ index f1fae3f17..7da0cd7ae 100644
  
      virtual void getWindowSize(
 -- 
-2.54.0
+2.55.0
 
