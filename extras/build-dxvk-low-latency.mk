@@ -11,6 +11,7 @@ DXVK_LOW_LATENCY_arm64ec_SOURCE_DATE_EPOCH := $(shell expr $(arm64ec_SOURCE_DATE
 
 DXVK_LOW_LATENCY_SOURCE_ARGS = \
   --exclude version.h.in \
+  --exclude /subprojects/libdisplay-info \
 
 DXVK_LOW_LATENCY_MESON_ARGS = -Db_ndebug=true --force-fallback-for=libdisplay-info
 DXVK_LOW_LATENCY_i386_MESON_ARGS = --bindir=$(DXVK_LOW_LATENCY_i386_DST)/lib/wine/dxvk-low-latency/i386-windows
@@ -28,7 +29,11 @@ $(eval $(call rules-meson,dxvk-low-latency,i386,windows))
 $(eval $(call rules-meson,dxvk-low-latency,x86_64,windows))
 $(eval $(call rules-meson,dxvk-low-latency,arm64ec,windows))
 
+# Share regular DXVK's pinned EDID parser without changing the upstream checkout.
+$(OBJ)/.dxvk-low-latency-source: $(OBJ)/.dxvk-source
+
 $(OBJ)/.dxvk-low-latency-post-source: patches-source
+	rsync --exclude .git -Oar --delete "$(DXVK_SRC)/subprojects/libdisplay-info/" "$(DXVK_LOW_LATENCY_SRC)/subprojects/libdisplay-info/"
 	$(foreach p,$(shell find $(PATCHES_SRC)/extras/dxvk-low-latency/ -name "*.patch" | sort),patch -d $(DXVK_LOW_LATENCY_SRC) -Np1 -i $(p) &&) true
 	sed -re 's#@VCS_TAG@#$(shell git -C $(SRCDIR)/extras//dxvk-low-latency describe --always --abbrev=15 --dirty=0)#' \
 	    $(SRCDIR)/extras/dxvk-low-latency/version.h.in > $(DXVK_LOW_LATENCY_SRC)/version.h.in
