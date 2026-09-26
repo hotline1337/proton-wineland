@@ -219,6 +219,43 @@ class ComponentArchitectureTests(unittest.TestCase):
                 self.assertEqual(result.stdout.splitlines(),
                                  [expected, "--bindir=/fixture/nvapi-arm64ec/lib/wine/nvapi/aarch64-windows"])
 
+    def test_vkd3d_import_libraries_and_dependency_policy(self):
+        makefile = (ROOT / "Makefile.in").read_text()
+        start = makefile.index("ifeq ($(shell cc --version|grep 'clang'),)",
+                               makefile.index("WINE_aarch64_AUTOCONF_ARGS"))
+        rules = makefile[start:makefile.index("ifneq ($(WITHOUT_TTS),1)", start)]
+        cases = (("gcc", "i386 x86_64", True), ("gcc", "x86_64", False),
+                 ("clang", "i386 x86_64", False), ("clang", "aarch64", False))
+        for compiler, unix_archs, enabled in cases:
+            with self.subTest(compiler=compiler, unix_archs=unix_archs), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                cc = directory / "cc"
+                cc.write_text("#!/bin/sh\nprintf '%s\\n' '" + compiler + "'\n")
+                cc.chmod(0o755)
+                fixture = directory / "vkd3d.mk"
+                fixture.write_text(
+                    "unix_ARCHS := " + unix_archs + "\n"
+                    "VKD3D_i386_LIBDIR := /fixture/i386/lib\n"
+                    "VKD3D_x86_64_LIBDIR := /fixture/x86_64/lib\n" + rules +
+                    "\n.PHONY: check\ncheck:\n"
+                    "\t@printf '%s\\n' '$(WINE_i386_AUTOCONF_ARGS)' "
+                    "'$(WINE_x86_64_AUTOCONF_ARGS)' '$(WINE_VKD3D_DEPENDENCY)'\n")
+                environment = os.environ.copy()
+                environment["PATH"] = str(directory) + os.pathsep + environment["PATH"]
+                result = subprocess.run(["make", "--no-print-directory", "-f", str(fixture), "check"],
+                                        cwd=directory, env=environment, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                values = result.stdout.splitlines()
+                self.assertEqual(values[-1], "vkd3d" if enabled else "")
+                for architecture, arguments in zip(("i386", "x86_64"), values[:2]):
+                    if enabled:
+                        self.assertIn('VKD3D_PE_LIBS="-L/fixture/' + architecture +
+                                      '/lib -lvkd3d -lvkd3d-shader -lvkd3d-utils"', arguments)
+                        self.assertNotIn("-l:", arguments)
+                        self.assertNotIn(".dll", arguments)
+                    else:
+                        self.assertEqual(arguments, "")
+
 
 if __name__ == "__main__":
     unittest.main()
