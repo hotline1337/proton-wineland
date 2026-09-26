@@ -98,6 +98,23 @@ class LauncherDefaults(unittest.TestCase):
                     exec(compile_statements([assignment]), namespace)
                     self.assertEqual(namespace["use_nvapi"], expected)
 
+    def test_fex_cache_default_and_overrides(self):
+        block = next(node for node in INIT_SESSION.body if isinstance(node, ast.If)
+                     and has_string(node.test, "aarch64") and has_string(node, "FEX_DISKCACHE"))
+        default = next(node for node in block.body if has_string(node, "FEX_DISKCACHE"))
+        statement = ast.fix_missing_locations(ast.If(test=block.test, body=[default], orelse=[]))
+        for architecture in ("x86_64", "aarch64"):
+            for override in (None, "0", "", "1"):
+                with self.subTest(architecture=architecture, override=override):
+                    environment = {} if override is None else {"FEX_DISKCACHE": override}
+                    namespace = {
+                        "self": SimpleNamespace(env=environment),
+                        "platform": SimpleNamespace(machine=lambda: architecture),
+                    }
+                    exec(compile_statements([statement]), namespace)
+                    expected = "1" if architecture == "aarch64" and override is None else override
+                    self.assertEqual(environment.get("FEX_DISKCACHE"), expected)
+
 
 if __name__ == "__main__":
     unittest.main()
