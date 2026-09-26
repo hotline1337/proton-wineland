@@ -1,4 +1,4 @@
-From 6f85c299a42077025ddd52010c46a6fd467e819b Mon Sep 17 00:00:00 2001
+From 96f4a56719197b67ce95d8790dd3ef09590804d1 Mon Sep 17 00:00:00 2001
 From: Erhan Bilgili <erhan.bilgili@gmail.com>
 Date: Mon, 14 Sep 2026 00:03:15 +0200
 Subject: [PATCH] upscalers: Fetch Streamline for OptiScaler nightlies.
@@ -461,7 +461,7 @@ index 0000000..7dd9fc8
 +if __name__ == '__main__':
 +    unittest.main()
 diff --git a/upscalers.py b/upscalers.py
-index 1a90db3..6b474a1 100644
+index fb72dc3..e699393 100644
 --- a/upscalers.py
 +++ b/upscalers.py
 @@ -19,6 +19,7 @@ from urllib.parse import unquote, urlparse
@@ -492,6 +492,3 @@ index 1a90db3..6b474a1 100644
  
      if enabled and (env_config := env.get('PROTON_OPTISCALER_CONFIG', '')):
          ini = os.path.join(prefix_dir, nightly.ROOT, 'OptiScaler.ini')
--- 
-2.55.0
-

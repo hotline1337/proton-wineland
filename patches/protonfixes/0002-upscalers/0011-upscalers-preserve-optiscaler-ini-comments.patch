@@ -1,4 +1,4 @@
-From 3c6683181d91bac2a907f5c7f5ef81a7d95924d6 Mon Sep 17 00:00:00 2001
+From 4ce753edd7d1b79f1a6789325e0aa788ea90eb3b Mon Sep 17 00:00:00 2001
 From: Erhan Bilgili <erhan.bilgili@gmail.com>
 Date: Sun, 13 Sep 2026 23:56:18 +0200
 Subject: [PATCH] upscalers: Preserve OptiScaler INI comments.
@@ -205,7 +205,7 @@ index fd5b157..046bd5e 100644
          self.assertEqual(parser['Libraries']['NvngxDlssPath'], r'c:\windows\system32\umu')
          self.assertEqual(parser['Hotfix']['CheckForUpdate'], 'false')
 diff --git a/upscalers.py b/upscalers.py
-index 89b3c33..1a90db3 100644
+index 20d0e6f..fb72dc3 100644
 --- a/upscalers.py
 +++ b/upscalers.py
 @@ -3,7 +3,6 @@
@@ -246,6 +246,3 @@ index 89b3c33..1a90db3 100644
  
      return enabled
  
--- 
-2.55.0
-

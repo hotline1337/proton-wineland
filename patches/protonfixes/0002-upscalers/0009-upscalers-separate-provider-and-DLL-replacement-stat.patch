@@ -1,21 +1,48 @@
-From c7cb901c74477220f4383cc72e52a39879a0cb11 Mon Sep 17 00:00:00 2001
+From cda2c1934a0df9d8391b99e7d32ffa436010103c Mon Sep 17 00:00:00 2001
 From: Erhan Bilgili <erhan.bilgili@gmail.com>
 Date: Sun, 23 Aug 2026 07:51:11 +0200
-Subject: [PATCH 9/9] upscalers: Separate provider and DLL replacement state.
+Subject: [PATCH] upscalers: Separate provider and DLL replacement state.
 
 amdxcffx64.dll is loaded through Wine's AMD FFX provider and does not
 need loader path redirection. Keep its successful installation in the
 upscaler state while excluding the fsr4 token from
 WINE_UPSCALER_REPLACE.
+
+Keep the provider available for Wine's automatic selection and preserve
+FSR4_UPGRADE / MLFG_UPGRADE forwarding after successful setup. Upstream
+no longer supplies this policy, but Wineland still consumes these flags.
 ---
- upscalers.py | 5 +++--
- 1 file changed, 3 insertions(+), 2 deletions(-)
+ upscalers.py | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
 
 diff --git a/upscalers.py b/upscalers.py
-index f45515c..24801e4 100644
+index c5405d6..b1d8c6c 100644
 --- a/upscalers.py
 +++ b/upscalers.py
-@@ -686,8 +686,9 @@ def setup_upscalers(
+@@ -639,8 +639,8 @@ def setup_upscalers(
+     upscalers = (
+         ('dlss', dlss_version, 'dlss' in compat_config or 'optiscaler' in compat_config),
+         ('xess', xess_version, 'xess' in compat_config or 'optiscaler' in compat_config),
+-        # amdxcffx64 4.1.1
+-        ('fsr4', fsr4_version, 'fsr4' in compat_config),
++        # Wine also uses this provider without an explicit upgrade request.
++        ('fsr4', fsr4_version, True),
+         # fidelityfx sdk
+         ('ffx3', ffx3_version, 'ffx3' in compat_config or 'optiscaler' in compat_config),
+         ('ffx4', ffx4_version, 'ffx4' in compat_config),
+@@ -663,7 +663,10 @@ def setup_upscalers(
+             upscaler_replace.clear()
+ 
+     if 'fsr4' in upscaler_replace:
+-        pass
++        if 'fsr4' in compat_config:
++            env['FSR4_UPGRADE'] = '1'
++        if 'mlfg' in compat_config:
++            env['MLFG_UPGRADE'] = '1'
+ 
+     if 'dlss' in upscaler_replace:
+         env.setdefault(
+@@ -684,8 +687,9 @@ def setup_upscalers(
      if 'ffx4' in upscaler_replace:
          pass
  
@@ -27,6 +54,3 @@ index f45515c..24801e4 100644
          log.debug(f'WINE_UPSCALER_REPLACE: {env["WINE_UPSCALER_REPLACE"]}.')
  
  
--- 
-2.55.0
-

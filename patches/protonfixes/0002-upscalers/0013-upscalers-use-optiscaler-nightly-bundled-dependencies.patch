@@ -1,3 +1,6 @@
+From 3f756ffaf783fbb8fd17cbfbf4d7eea09766ace5 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Thu, 17 Sep 2026 14:35:50 +0200
 Subject: [PATCH] upscalers: Use OptiScaler nightly's bundled dependencies.
 
 Avoid downloading standalone XeSS and FidelityFX libraries solely for a
@@ -8,9 +11,14 @@ Migrate only checksum-matching installer-owned duplicates with validated
 bundled replacements. Preserve custom paths and user files, and roll back
 removal if tracking cannot be saved. Cover selection and migration in tests.
 
+Also verify the retained Wine provider setup and upgrade flags.
 ---
+ tests/test_optiscaler.py | 238 +++++++++++++++++++++++++++++++++++++++
+ upscalers.py             |  91 ++++++++++++++-
+ 2 files changed, 326 insertions(+), 3 deletions(-)
+
 diff --git a/tests/test_optiscaler.py b/tests/test_optiscaler.py
-index f5bfbf2..fc8b57b 100644
+index f5bfbf2..f3801e3 100644
 --- a/tests/test_optiscaler.py
 +++ b/tests/test_optiscaler.py
 @@ -95,6 +95,212 @@ class OptiscalerTests(unittest.TestCase):
@@ -226,8 +234,47 @@ index f5bfbf2..fc8b57b 100644
      def test_streamline_only_follows_installed_nightly(self):
          archive, item = self.stable_archive()
          with mock.patch.object(upscalers, '__get_opti_files', return_value=(nightly.ROOT, item)), \
+@@ -109,6 +315,38 @@ class OptiscalerTests(unittest.TestCase):
+             self.assertTrue(self.setup('nightly'))
+         self.assertEqual(self.streamline_setup.call_count, 2)
+ 
++    def test_provider_setup_preserves_wine_upgrade_policy(self):
++        for config in (set(), {'fsr4'}, {'mlfg'}, {'fsr4', 'mlfg'}):
++            with self.subTest(config=config):
++                env = {}
++                with mock.patch.object(upscalers, 'setup_upscaler', return_value=True) as setup:
++                    upscalers.setup_upscalers(config, env, self.compat, self.prefix)
++                setup.assert_called_once_with('fsr4', self.compat, self.prefix, 'default')
++                self.assertEqual(env.get('FSR4_UPGRADE'), '1' if 'fsr4' in config else None)
++                self.assertEqual(env.get('MLFG_UPGRADE'), '1' if 'mlfg' in config else None)
++                self.assertNotIn('WINE_UPSCALER_REPLACE', env)
++
++    def test_provider_failure_does_not_enable_upgrades(self):
++        env = {}
++        with mock.patch.object(upscalers, 'setup_upscaler', return_value=False):
++            upscalers.setup_upscalers({'fsr4', 'mlfg'}, env, self.compat, self.prefix)
++        self.assertNotIn('FSR4_UPGRADE', env)
++        self.assertNotIn('MLFG_UPGRADE', env)
++        self.assertNotIn('WINE_UPSCALER_REPLACE', env)
++
++    def test_provider_setup_respects_selected_version(self):
++        env = {'PROTON_FSR4_UPGRADE': '4.0.0'}
++        with mock.patch.object(upscalers, 'setup_upscaler', return_value=True) as setup:
++            upscalers.setup_upscalers({'fsr4'}, env, self.compat, self.prefix)
++        setup.assert_called_once_with('fsr4', self.compat, self.prefix, '4.0.0')
++        self.assertEqual(env['FSR4_UPGRADE'], '1')
++
++    def test_provider_setup_does_not_overwrite_direct_wine_overrides(self):
++        env = {'FSR4_UPGRADE': '0', 'MLFG_UPGRADE': '0'}
++        with mock.patch.object(upscalers, 'setup_upscaler', return_value=True):
++            upscalers.setup_upscalers(set(), env, self.compat, self.prefix)
++        self.assertEqual(env, {'FSR4_UPGRADE': '0', 'MLFG_UPGRADE': '0'})
++
+     def test_failed_streamline_bootstrap_does_not_disable_optiscaler(self):
+         self.streamline_setup.side_effect = streamline_setup
+         with mock.patch.object(upscalers.streamline, 'resolve', side_effect=OSError('offline')):
 diff --git a/upscalers.py b/upscalers.py
-index 6b474a1..54007a6 100644
+index e699393..72440d8 100644
 --- a/upscalers.py
 +++ b/upscalers.py
 @@ -5,6 +5,7 @@ import fcntl
@@ -312,20 +359,21 @@ index 6b474a1..54007a6 100644
  def setup_upscalers(
      compat_config: set, env: dict, compat_dir: str, prefix_dir: str
  ) -> None:
-@@ -656,10 +724,10 @@ def setup_upscalers(
+@@ -656,11 +724,11 @@ def setup_upscalers(
      upscaler_replace = set()
      upscalers = (
          ('dlss', dlss_version, 'dlss' in compat_config or 'optiscaler' in compat_config),
 -        ('xess', xess_version, 'xess' in compat_config or 'optiscaler' in compat_config),
 +        ('xess', xess_version, 'xess' in compat_config),
-         # amdxcffx64 4.1.1
+         # Wine also uses this provider without an explicit upgrade request.
          ('fsr4', fsr4_version, True),
+         # fidelityfx sdk
 -        ('ffx3', ffx3_version, 'ffx3' in compat_config or 'optiscaler' in compat_config),
 +        ('ffx3', ffx3_version, 'ffx3' in compat_config),
          ('ffx4', ffx4_version, 'ffx4' in compat_config),
      )
      for upscaler in upscalers:
-@@ -669,7 +737,24 @@ def setup_upscalers(
+@@ -670,7 +738,24 @@ def setup_upscalers(
              upscaler_replace.add(name)
  
      if 'optiscaler' in compat_config:
