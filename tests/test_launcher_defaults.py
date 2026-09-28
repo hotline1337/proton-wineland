@@ -82,6 +82,22 @@ class LauncherDefaults(unittest.TestCase):
         self.assertNotIn("WINEARCH", self.wow64("4005300", architecture="aarch64").env)
         self.assertEqual(self.wow64("0", override="1").env["WINEARCH"], "wow64")
 
+    def test_nvapi_architecture_and_overrides(self):
+        assignment = next(node for node in ast.walk(TREE) if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == "use_nvapi"
+                                  for target in node.targets))
+        for architecture in ("x86_64-windows", "aarch64-windows"):
+            for configuration, expected in ((set(), True), ({"disablenvapi"}, False),
+                                            ({"forcenvapi"}, True),
+                                            ({"disablenvapi", "forcenvapi"}, True)):
+                with self.subTest(architecture=architecture, configuration=configuration):
+                    namespace = {
+                        "g_session": SimpleNamespace(compat_config=configuration),
+                        "g_proton": SimpleNamespace(host_pe_arch=architecture),
+                    }
+                    exec(compile_statements([assignment]), namespace)
+                    self.assertEqual(namespace["use_nvapi"], expected)
+
 
 if __name__ == "__main__":
     unittest.main()

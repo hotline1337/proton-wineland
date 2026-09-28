@@ -192,5 +192,33 @@ class WrapperArchitectureTests(unittest.TestCase):
         self.assertNotIn("obj-wine-x86_64", result.stdout)
 
 
+class ComponentArchitectureTests(unittest.TestCase):
+    def test_nvapi_build_and_destination(self):
+        makefile = (ROOT / "Makefile.in").read_text()
+        rules = makefile[makefile.index("DXVK_NVAPI_MESON_ARGS ="):
+                         makefile.index("VKD3D_SOURCE_ARGS =")]
+        for architecture, expected in (("x86_64", "i386 x86_64"),
+                                       ("arm64", "i386 x86_64 arm64ec")):
+            with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                fixture = directory / "components.mk"
+                archs = "i386-windows x86_64-windows"
+                if architecture == "arm64":
+                    archs += " aarch64-windows arm64ec-windows"
+                fixture.write_text(
+                    "ARCHS := " + archs + "\n"
+                    "DXVK_NVAPI_arm64ec_DST := /fixture/nvapi-arm64ec\n"
+                    "define rules-meson\n"
+                    "$(if $(filter $(2)-$(3),$(ARCHS)),$(eval enabled += $(2)))\n"
+                    "endef\n" + rules +
+                    "\n.PHONY: check\ncheck:\n"
+                    "\t@printf '%s\\n' '$(enabled)' '$(DXVK_NVAPI_arm64ec_MESON_ARGS)'\n")
+                result = subprocess.run(["make", "--no-print-directory", "-f", str(fixture), "check"],
+                                        cwd=directory, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.splitlines(),
+                                 [expected, "--bindir=/fixture/nvapi-arm64ec/lib/wine/nvapi/aarch64-windows"])
+
+
 if __name__ == "__main__":
     unittest.main()
