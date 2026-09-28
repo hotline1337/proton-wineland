@@ -42,7 +42,9 @@ Visit Wine at
 
 View our modifications at
 
-    https://github.com/ValveSoftware/wine
+    https://github.com/nanomatters/wine-cachyos
+
+The full LGPL 2.1 text is included at licenses/vkd3d-proton/LICENSE.
 
 ---- ---- ---- ----
 
@@ -50,6 +52,11 @@ This software contains a modified version of DXVK licensed under the zlib/libpng
 
     Copyright (c) 2017-2022 Philip Rebohle
     Copyright (c) 2019-2022 Joshua Ashton
+    Copyright (c) 2019 Robin Kertels
+    Copyright (c) 2023 Jeffrey Ellison
+
+The full DXVK license, including the separate HUD font license, is included
+at licenses/dxvk/LICENSE.
 
 Visit DXVK at
 
@@ -57,7 +64,46 @@ Visit DXVK at
 
 View our modifications at
 
-    https://github.com/ValveSoftware/dxvk
+    https://github.com/nanomatters/dxvk-salkim
+
+---- ---- ---- ----
+
+DXVK and vkd3d-proton incorporate dxbc-spirv, licensed under MIT:
+
+    Copyright (c) 2025 Philip Rebohle
+
+The full notice is included at licenses/dxvk/subprojects/dxbc-spirv/LICENSE.
+The separately pinned copy used by vkd3d-proton has its own notice at
+licenses/vkd3d-proton/subprojects/dxil-spirv/subprojects/dxbc-spirv/LICENSE.
+
+Visit dxbc-spirv at
+
+    https://github.com/doitsujin/dxbc-spirv
+
+View our modifications at
+
+    https://github.com/nanomatters/dxbc-spirv-salkim
+
+---- ---- ---- ----
+
+vkd3d-proton incorporates dxil-spirv, licensed under MIT:
+
+    Copyright (c) 2019-2022 Hans-Kristian Arntzen for Valve Corporation
+
+Its full notice, including the bc-decoder and glslang-spirv notices, is
+included at licenses/vkd3d-proton/subprojects/dxil-spirv/LICENSE.MIT.
+
+Visit dxil-spirv at
+
+    https://github.com/HansKristian-Work/dxil-spirv
+
+View our modifications at
+
+    https://github.com/nanomatters/dxil-spirv-salkim
+
+The licenses/ directory also includes notices for the bundled Sarek and
+low-latency variants and their dependencies, under their original paths.
+Each component keeps its own license; Proton's license does not replace it.
 
 ---- ---- ---- ----
 
@@ -120,13 +166,33 @@ Visit hwdata at
 
 ---- ---- ---- ----
 
-This software contains vkd3d-proton licensed under the LGPL 2.1. vkd3d-proton is
+This software contains a modified version of vkd3d-proton licensed under the
+LGPL 2.1 or, at your option, any later version. vkd3d-proton is
 
-    Copyright 2016-2022 the vkd3d-proton project authors
+    Copyright 2016-2024 the vkd3d-proton project authors
+
+The full license, copyright notice and author list are included in
+licenses/vkd3d-proton/ as LICENSE, COPYING and AUTHORS respectively.
 
 Visit vkd3d-proton at
 
     https://github.com/HansKristian-Work/vkd3d-proton
+
+View our modifications at
+
+    https://github.com/nanomatters/vkd3d-proton-salkim
+
+For the source matching a binary release, use its release tag and the
+recursively pinned submodules in:
+
+    https://github.com/nanomatters/proton-cachyos
+
+Replace RELEASE_TAG with the tag matching this package's version file:
+
+    git clone --branch RELEASE_TAG --recurse-submodules https://github.com/nanomatters/proton-cachyos.git
+
+Build instructions are in README_PROTON.md. The release's submodule commits,
+not the current development branch tips, identify its component revisions.
 
 ---- ---- ---- ----
 
