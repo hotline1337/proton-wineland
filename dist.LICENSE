@@ -80,10 +80,6 @@ Visit dxbc-spirv at
 
     https://github.com/doitsujin/dxbc-spirv
 
-View our modifications at
-
-    https://github.com/nanomatters/dxbc-spirv-salkim
-
 ---- ---- ---- ----
 
 vkd3d-proton incorporates dxil-spirv, licensed under MIT:
@@ -96,10 +92,6 @@ included at licenses/vkd3d-proton/subprojects/dxil-spirv/LICENSE.MIT.
 Visit dxil-spirv at
 
     https://github.com/HansKristian-Work/dxil-spirv
-
-View our modifications at
-
-    https://github.com/nanomatters/dxil-spirv-salkim
 
 The licenses/ directory also includes notices for the bundled Sarek and
 low-latency variants and their dependencies, under their original paths.
