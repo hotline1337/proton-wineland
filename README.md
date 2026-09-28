@@ -239,7 +239,7 @@ PROTON_HUD=3,present.mode %command%
 This shows the renderer's selected mode. The compositor may still control how
 frames reach the display. No latency telemetry is needed for this field.
 
-An explicit `DXVK_HUD` takes precedence. See the [DXVK HUD options](dxvk/README.md#hud)
+An explicit `DXVK_HUD` takes precedence. See the [DXVK HUD options](https://github.com/nanomatters/dxvk-salkim#hud)
 for individual metrics, layout, and appearance settings.
 
 ### What do the presentation latency readings measure?
