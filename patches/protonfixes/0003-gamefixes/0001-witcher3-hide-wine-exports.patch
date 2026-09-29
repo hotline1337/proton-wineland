@@ -1,0 +1,38 @@
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Tue, 29 Sep 2026 17:07:54 +0200
+Subject: [PATCH] gamefixes: Hide Wine exports for The Witcher 3.
+
+The updated game checks for wine_get_version before initializing
+Streamline and disables frame generation when Wine is detected.
+
+Set HideWineExports under AppDefaults for witcher3.exe in the game's
+prefix. Leave other executables and the prefix-wide policy unchanged.
+Use the registry helper directly without invoking winetricks.
+
+This also bypasses the game's Wine-based ray-tracing restriction. It
+does not fix the underlying ray-tracing crashes.
+
+Link: https://github.com/nanomatters/proton-cachyos/issues/71
+---
+ gamefixes-steam/292030.py | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+ create mode 100644 gamefixes-steam/292030.py
+
+diff --git a/gamefixes-steam/292030.py b/gamefixes-steam/292030.py
+new file mode 100644
+--- /dev/null
++++ b/gamefixes-steam/292030.py
+@@ -0,0 +1,13 @@
++"""Game fix for The Witcher 3."""
++
++from protonfixes import util
++
++
++def main() -> None:
++    """Allow the game's Wine-gated Streamline initialization."""
++    util.regedit_add(
++        r'HKEY_CURRENT_USER\Software\Wine\AppDefaults\witcher3.exe',
++        'HideWineExports',
++        'REG_SZ',
++        'Y',
++    )
