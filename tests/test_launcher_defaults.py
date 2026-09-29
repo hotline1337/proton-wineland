@@ -115,6 +115,19 @@ class LauncherDefaults(unittest.TestCase):
                     expected = "1" if architecture == "aarch64" and override is None else override
                     self.assertEqual(environment.get("FEX_DISKCACHE"), expected)
 
+    def test_openssl_game_default_and_overrides(self):
+        block = next(node for node in INIT_SESSION.body if isinstance(node, ast.If)
+                     and has_string(node, "OPENSSL_ia32cap"))
+        for appid in ("522020", "661920", "0"):
+            for override in (None, "", "0", "~0x10000000"):
+                with self.subTest(appid=appid, override=override):
+                    environment = {} if override is None else {"OPENSSL_ia32cap": override}
+                    namespace = {"self": SimpleNamespace(env=environment), "os": os}
+                    with patch.dict(os.environ, {"SteamGameId": appid}, clear=True):
+                        exec(compile_statements([block]), namespace)
+                    expected = "~0x20000000" if appid != "0" and override is None else override
+                    self.assertEqual(environment.get("OPENSSL_ia32cap"), expected)
+
 
 if __name__ == "__main__":
     unittest.main()
