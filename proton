@@ -1963,12 +1963,12 @@ class Session:
             "3": (
                 "fps,fps_lows,gpu.load,gpu.power,gpu.temp,gpu.jtemp,gpu.clock,gpu.vram,newline,"
                 "cpu.load,cpu.power,cpu.temp,cpu.clock,bottom,winsys,proton,"
-                "gpu.driver,api,horizontal,center"
+                "gpu.driver,api,version,present.mode,horizontal,center"
             ),
             "4": (
                 "present_latency,newline,fps,fps_lows,gpu.load,gpu.power,"
                 "gpu.temp,gpu.jtemp,gpu.clock,gpu.vram,newline,cpu.load,cpu.power,cpu.temp,"
-                "cpu.clock,bottom,winsys,proton,gpu.driver,api,horizontal,center"
+                "cpu.clock,bottom,winsys,proton,gpu.driver,api,version,present.mode,horizontal,center"
             ),
             "5": "full,-systeminfo",
         }
