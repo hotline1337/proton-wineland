@@ -1,0 +1,47 @@
+From 2d13b63b0417fb63cce95ad1f3f367e88683d2f7 Mon Sep 17 00:00:00 2001
+From: Philip Rebohle <philip.rebohle@tu-dortmund.de>
+Date: Thu, 27 Aug 2026 16:52:11 +0200
+Subject: [PATCH 21/24] dxil: Also avoid divison by zero in legacy udiv.
+
+---
+ opcodes/dxil/dxil_arithmetic.cpp | 18 ++++++++++++------
+ 1 file changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/subprojects/dxil-spirv/opcodes/dxil/dxil_arithmetic.cpp b/subprojects/dxil-spirv/opcodes/dxil/dxil_arithmetic.cpp
+index 8c352471..9dae70b8 100644
+--- a/subprojects/dxil-spirv/opcodes/dxil/dxil_arithmetic.cpp
++++ b/subprojects/dxil-spirv/opcodes/dxil/dxil_arithmetic.cpp
+@@ -386,9 +386,20 @@ bool emit_dxbc_udiv_instruction(Converter::Impl &impl, const llvm::CallInst *ins
+ 	spv::Id id0 = impl.get_id_for_value(instruction->getOperand(1));
+ 	spv::Id id1 = impl.get_id_for_value(instruction->getOperand(2));
+ 
++	auto *is_zero_divider = impl.allocate(spv::OpIEqual, builder.makeBoolType());
++	is_zero_divider->add_id(id1);
++	is_zero_divider->add_id(builder.makeUintConstant(0));
++	impl.add(is_zero_divider);
++
++	auto *divisor_select = impl.allocate(spv::OpSelect, builder.makeUintType(32));
++	divisor_select->add_id(is_zero_divider->id);
++	divisor_select->add_id(builder.makeUintConstant(UINT32_MAX));
++	divisor_select->add_id(id1);
++	impl.add(divisor_select);
++
+ 	auto *div_op = impl.allocate(spv::OpUDiv, builder.makeUintType(32));
+ 	div_op->add_id(id0);
+-	div_op->add_id(id1);
++	div_op->add_id(divisor_select->id);
+ 	impl.add(div_op);
+ 
+ 	auto *mod_op = impl.allocate(spv::OpUMod, builder.makeUintType(32));
+@@ -396,11 +407,6 @@ bool emit_dxbc_udiv_instruction(Converter::Impl &impl, const llvm::CallInst *ins
+ 	mod_op->add_id(id1);
+ 	impl.add(mod_op);
+ 
+-	auto *is_zero_divider = impl.allocate(spv::OpIEqual, builder.makeBoolType());
+-	is_zero_divider->add_id(id1);
+-	is_zero_divider->add_id(builder.makeUintConstant(0));
+-	impl.add(is_zero_divider);
+-
+ 	auto *quot_select = impl.allocate(spv::OpSelect, builder.makeUintType(32));
+ 	quot_select->add_id(is_zero_divider->id);
+ 	quot_select->add_id(builder.makeUintConstant(UINT32_MAX));

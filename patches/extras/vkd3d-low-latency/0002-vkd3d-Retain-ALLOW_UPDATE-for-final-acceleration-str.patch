@@ -1,0 +1,341 @@
+From b3e1cb71f138bc45636a9de092157f093d3e2977 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Tue, 29 Sep 2026 19:01:08 +0200
+Subject: [PATCH 2/2] vkd3d: Retain ALLOW_UPDATE for final acceleration
+ structure updates.
+
+D3D12 permits the final update to omit ALLOW_UPDATE. Vulkan requires
+update flags to match the source build, so retain the flag after input
+conversion, before the build is submitted.
+
+Test final BLAS and TLAS updates both in place and out of place,
+with ray-query readback checks.
+---
+ libs/vkd3d/command.c     |   7 ++
+ tests/d3d12_raytracing.c | 134 ++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 124 insertions(+), 17 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 1273fb05..22c5df44 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -1,4 +1,6 @@
+ /*
++ * Salkim modifications by Erhan Bilgili on 2026-09-30.
++ *
+  * Copyright 2016 Józef Kucia for CodeWeavers
+  * Copyright 2016 Henri Verbeet for CodeWeavers
+  *
+@@ -20598,6 +20600,11 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
+         return;
+     }
+ 
++    /* D3D12 allows clearing ALLOW_UPDATE on the final update, but Vulkan
++     * requires the update flags to match the source build. */
++    if (build_info->mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR)
++        build_info->flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
++
+     if (!vkd3d_acceleration_structure_resolve_omm_va_maps(list->device, &desc->Inputs,
+             omm_triangles_infos))
+         return;
+diff --git a/tests/d3d12_raytracing.c b/tests/d3d12_raytracing.c
+index 1ed01dbc..e029e7b4 100644
+--- a/tests/d3d12_raytracing.c
++++ b/tests/d3d12_raytracing.c
+@@ -1,4 +1,6 @@
+ /*
++ * Salkim modifications by Erhan Bilgili on 2026-09-30.
++ *
+  * Copyright 2016-2017 Józef Kucia for CodeWeavers
+  * Copyright 2020-2021 Philip Rebohle for Valve Corporation
+  * Copyright 2020-2021 Joshua Ashton for Valve Corporation
+@@ -333,21 +335,49 @@ static ID3D12Resource *duplicate_acceleration_structure(struct raytracing_test_c
+ 
+ static void update_acceleration_structure(struct raytracing_test_context *context,
+         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *inputs,
+-        struct rt_acceleration_structure *rtas)
++        struct rt_acceleration_structure *rtas, ID3D12Resource *dst_rtas)
+ {
+     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build_info;
+-    build_info.DestAccelerationStructureData = ID3D12Resource_GetGPUVirtualAddress(rtas->rtas);
+-    /* In-place update is supported. */
++    build_info.DestAccelerationStructureData = ID3D12Resource_GetGPUVirtualAddress(dst_rtas);
+     build_info.SourceAccelerationStructureData = ID3D12Resource_GetGPUVirtualAddress(rtas->rtas);
+     build_info.Inputs = *inputs;
+     build_info.Inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
+     build_info.ScratchAccelerationStructureData = ID3D12Resource_GetGPUVirtualAddress(rtas->scratch_update);
+ 
+     ID3D12GraphicsCommandList4_BuildRaytracingAccelerationStructure(context->list4, &build_info, 0, NULL);
+-    uav_barrier(context->context.list, rtas->rtas);
++    uav_barrier(context->context.list, dst_rtas);
+     uav_barrier(context->context.list, rtas->scratch_update);
+ }
+ 
++static ID3D12Resource *create_acceleration_structure_update_destination(ID3D12Device *device,
++        ID3D12Resource *source, ID3D12Heap **heap)
++{
++    D3D12_RESOURCE_ALLOCATION_INFO allocation_info;
++    D3D12_RESOURCE_DESC resource_desc;
++    D3D12_HEAP_DESC heap_desc;
++    HRESULT hr;
++
++    resource_desc = ID3D12Resource_GetDesc(source);
++    allocation_info = ID3D12Device_GetResourceAllocationInfo(device, 0, 1, &resource_desc);
++    memset(&heap_desc, 0, sizeof(heap_desc));
++    heap_desc.SizeInBytes = allocation_info.SizeInBytes;
++    if (heap_desc.SizeInBytes < 2 * 1024 * 1024)
++        heap_desc.SizeInBytes = 2 * 1024 * 1024;
++    heap_desc.Alignment = allocation_info.Alignment;
++    heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
++    heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
++
++    /* Keep the update destination in a separate backing allocation, since vkd3d's
++     * Vulkan acceleration structure views extend to its end. Heaps smaller than
++     * 2 MiB can be suballocated together with the source acceleration structure. */
++    hr = ID3D12Device_CreateHeap(device, &heap_desc, &IID_ID3D12Heap, (void **)heap);
++    assert_that(SUCCEEDED(hr), "Failed to create update destination heap, hr %#x.\n", (int)hr);
++
++    return create_placed_buffer(device, *heap, 0, resource_desc.Width,
++            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
++            D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
++}
++
+ static void create_acceleration_structure(struct raytracing_test_context *context,
+         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *inputs,
+         struct rt_acceleration_structure *rtas, D3D12_GPU_VIRTUAL_ADDRESS postbuild_va)
+@@ -452,6 +482,8 @@ struct test_rt_geometry
+     ID3D12Resource *transform_buffer;
+     ID3D12Resource *aabb_buffer;
+     ID3D12Resource *instance_buffer;
++    ID3D12Heap *bottom_update_heap;
++    ID3D12Heap *top_update_heap;
+ };
+ 
+ struct test_rt_omm_geometry
+@@ -485,6 +517,10 @@ static void destroy_rt_geometry(struct test_rt_geometry *rt_geom)
+     destroy_acceleration_structure(&rt_geom->bottom_rtas_tri);
+     destroy_acceleration_structure(&rt_geom->bottom_rtas_aabb);
+     destroy_acceleration_structure(&rt_geom->top_rtas);
++    if (rt_geom->bottom_update_heap)
++        ID3D12Heap_Release(rt_geom->bottom_update_heap);
++    if (rt_geom->top_update_heap)
++        ID3D12Heap_Release(rt_geom->top_update_heap);
+ }
+ 
+ static void destroy_rt_omm_geometry(struct test_rt_omm_geometry *rt_omm_geom)
+@@ -624,7 +660,7 @@ static void init_rt_omm_geometry(struct raytracing_test_context *context,
+     {
+         if (config->blas_build_flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_OMM_LINKAGE_UPDATE)
+             omm_linkage.OpacityMicromapArray = ID3D12Resource_GetGPUVirtualAddress(rt_omm_geom->omm);
+-        update_acceleration_structure(context, &inputs, &rt_omm_geom->blas);
++        update_acceleration_structure(context, &inputs, &rt_omm_geom->blas, rt_omm_geom->blas.rtas);
+     }
+ 
+     inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+@@ -643,11 +679,18 @@ static void init_rt_omm_geometry(struct raytracing_test_context *context,
+     create_acceleration_structure(context, &inputs, &rt_omm_geom->tlas, 0);
+ }
+ 
++enum rt_update_mode
++{
++    RT_UPDATE_ALLOW,
++    RT_UPDATE_FINAL_IN_PLACE,
++    RT_UPDATE_FINAL_OUT_OF_PLACE,
++};
++
+ static void init_rt_geometry(struct raytracing_test_context *context, struct test_rt_geometry *rt_geom,
+         struct test_geometry *geom,
+         unsigned int num_geom_desc, float geom_offset_x,
+         unsigned int num_unmasked_instances_y, float instance_geom_scale, float instance_offset_y,
+-        D3D12_GPU_VIRTUAL_ADDRESS postbuild_va)
++        D3D12_GPU_VIRTUAL_ADDRESS postbuild_va, enum rt_update_mode update_mode)
+ {
+ #define NUM_GEOM_TEMPLATES 6
+ #define NUM_AABB_PER_GEOM 2
+@@ -655,8 +698,12 @@ static void init_rt_geometry(struct raytracing_test_context *context, struct tes
+     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs;
+     D3D12_RAYTRACING_INSTANCE_DESC *instance_desc;
+     D3D12_RAYTRACING_GEOMETRY_DESC *geom_desc;
++    size_t instance_buffer_size;
+     unsigned int i;
+ 
++    rt_geom->bottom_update_heap = NULL;
++    rt_geom->top_update_heap = NULL;
++
+     /* Create X * Y quads where X = num_geom_desc, and Y = num_unmasked_instances_y.
+      * Additionally, create a set of quads at Y iteration -1 which are intended to be masked
+      * (miss shader should be triggered).
+@@ -741,12 +788,27 @@ static void init_rt_geometry(struct raytracing_test_context *context, struct tes
+ 
+     create_acceleration_structure(context, &inputs, &rt_geom->bottom_rtas_tri, postbuild_va);
+ 
++    if (update_mode == RT_UPDATE_FINAL_OUT_OF_PLACE)
++    {
++        rt_geom->bottom_acceleration_structures_tri[0] = create_acceleration_structure_update_destination(
++                context->context.device, rt_geom->bottom_rtas_tri.rtas, &rt_geom->bottom_update_heap);
++    }
++    else
++    {
++        rt_geom->bottom_acceleration_structures_tri[0] = rt_geom->bottom_rtas_tri.rtas;
++        ID3D12Resource_AddRef(rt_geom->bottom_rtas_tri.rtas);
++    }
++
+     /* Update, and now use correct VBO. */
+     geom_desc_template[1].Triangles.VertexBuffer.StartAddress =
+             ID3D12Resource_GetGPUVirtualAddress(geom->vbo) + offsetof(struct initial_vbo, f32);
+     for (i = 1; i < num_geom_desc; i += ARRAY_SIZE(geom_desc_template))
+         geom_desc[i].Triangles.VertexBuffer = geom_desc_template[1].Triangles.VertexBuffer;
+-    update_acceleration_structure(context, &inputs, &rt_geom->bottom_rtas_tri);
++    if (update_mode != RT_UPDATE_ALLOW)
++        inputs.Flags &= ~D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
++    update_acceleration_structure(context, &inputs, &rt_geom->bottom_rtas_tri,
++            rt_geom->bottom_acceleration_structures_tri[0]);
++    inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
+ 
+     for (i = 0; i < num_geom_desc; i++)
+     {
+@@ -761,8 +823,6 @@ static void init_rt_geometry(struct raytracing_test_context *context, struct tes
+ 
+     /* Tests CLONE and COMPACTING copies. COMPACTING can never increase size, so it's safe to allocate up front.
+      * We test the compacted size later. */
+-    rt_geom->bottom_acceleration_structures_tri[0] = rt_geom->bottom_rtas_tri.rtas;
+-    ID3D12Resource_AddRef(rt_geom->bottom_rtas_tri.rtas);
+     rt_geom->bottom_acceleration_structures_tri[1] = duplicate_acceleration_structure(context,
+             rt_geom->bottom_acceleration_structures_tri[0],
+             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT);
+@@ -780,7 +840,8 @@ static void init_rt_geometry(struct raytracing_test_context *context, struct tes
+             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_CLONE);
+ 
+     /* Create instance buffer. One for every top-level entry into the AS. */
+-    instance_desc = calloc(num_unmasked_instances_y + 1, sizeof(*instance_desc));
++    instance_buffer_size = (num_unmasked_instances_y + 1) * sizeof(*instance_desc);
++    instance_desc = calloc(update_mode == RT_UPDATE_ALLOW ? 1 : 2, instance_buffer_size);
+ 
+     for (i = 0; i < num_unmasked_instances_y; i++)
+     {
+@@ -816,8 +877,16 @@ static void init_rt_geometry(struct raytracing_test_context *context, struct tes
+     instance_desc[num_unmasked_instances_y].AccelerationStructure =
+             ID3D12Resource_GetGPUVirtualAddress(rt_geom->bottom_acceleration_structures_tri[2]);
+ 
++    if (update_mode != RT_UPDATE_ALLOW)
++    {
++        /* Build with masked instances, then update to the expected masks. */
++        memcpy(instance_desc + num_unmasked_instances_y + 1, instance_desc, instance_buffer_size);
++        for (i = 0; i < num_unmasked_instances_y; i++)
++            instance_desc[i].InstanceMask = 0xfe;
++    }
++
+     rt_geom->instance_buffer = create_upload_buffer(context->context.device,
+-            (num_unmasked_instances_y + 1) * sizeof(*instance_desc), instance_desc);
++            instance_buffer_size * (update_mode == RT_UPDATE_ALLOW ? 1 : 2), instance_desc);
+ 
+     /* Create top AS */
+     memset(&inputs, 0, sizeof(inputs));
+@@ -827,14 +896,33 @@ static void init_rt_geometry(struct raytracing_test_context *context, struct tes
+     inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+     inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE |
+             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION;
++    if (update_mode != RT_UPDATE_ALLOW)
++        inputs.Flags |= D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
+ 
+     create_acceleration_structure(context, &inputs, &rt_geom->top_rtas,
+             postbuild_va ? (postbuild_va + 4 * sizeof(uint64_t)) : 0);
+ 
++    if (update_mode == RT_UPDATE_FINAL_OUT_OF_PLACE)
++    {
++        rt_geom->top_acceleration_structures[0] = create_acceleration_structure_update_destination(
++                context->context.device, rt_geom->top_rtas.rtas, &rt_geom->top_update_heap);
++    }
++    else
++    {
++        rt_geom->top_acceleration_structures[0] = rt_geom->top_rtas.rtas;
++        ID3D12Resource_AddRef(rt_geom->top_rtas.rtas);
++    }
++
++    if (update_mode != RT_UPDATE_ALLOW)
++    {
++        inputs.InstanceDescs += instance_buffer_size;
++        inputs.Flags &= ~D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
++        update_acceleration_structure(context, &inputs, &rt_geom->top_rtas,
++                rt_geom->top_acceleration_structures[0]);
++    }
++
+     /* Tests CLONE and COMPACTING copies. COMPACTING can never increase size, so it's safe to allocate up front.
+      * We test the compacted size later. */
+-    rt_geom->top_acceleration_structures[0] = rt_geom->top_rtas.rtas;
+-    ID3D12Resource_AddRef(rt_geom->top_rtas.rtas);
+     rt_geom->top_acceleration_structures[1] = duplicate_acceleration_structure(context,
+             rt_geom->top_acceleration_structures[0], D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT);
+     rt_geom->top_acceleration_structures[2] = duplicate_acceleration_structure(context,
+@@ -1147,6 +1235,8 @@ enum rt_test_mode
+     TEST_MODE_PSO_SKIP_AABBS,
+     TEST_MODE_INDIRECT,
+     TEST_MODE_PSO_ADD_TO_STATE_OBJECT,
++    TEST_MODE_FINAL_UPDATE_IN_PLACE,
++    TEST_MODE_FINAL_UPDATE_OUT_OF_PLACE,
+ };
+ 
+ static ID3D12StateObject *create_rt_collection(struct raytracing_test_context *context,
+@@ -1280,7 +1370,7 @@ static void test_raytracing_pipeline(enum rt_test_mode mode, D3D12_RAYTRACING_TI
+     init_rt_geometry(&context, &test_rtases, &test_geom,
+             NUM_GEOM_DESC, GEOM_OFFSET_X,
+             NUM_UNMASKED_INSTANCES, INSTANCE_GEOM_SCALE, INSTANCE_OFFSET_Y,
+-            ID3D12Resource_GetGPUVirtualAddress(postbuild_buffer));
++            ID3D12Resource_GetGPUVirtualAddress(postbuild_buffer), RT_UPDATE_ALLOW);
+ 
+     /* Create global root signature. All RT shaders can access these parameters. */
+     {
+@@ -2105,6 +2195,7 @@ static void test_rayquery_pipeline(enum rt_test_mode mode, bool root_table)
+     const float miss_color_x = 1000.0f;
+     const float miss_color_y = 2000.0f;
+     D3D12_DESCRIPTOR_RANGE rs_range[1];
++    enum rt_update_mode update_mode;
+     struct test_geometry test_geom;
+     unsigned int i, instance, geom;
+     ID3D12Resource *ray_positions;
+@@ -2166,10 +2257,17 @@ static void test_rayquery_pipeline(enum rt_test_mode mode, bool root_table)
+     ok(SUCCEEDED(hr), "Failed to create root signature, hr #%x.\n", (int)hr);
+     pso = create_compute_pipeline_state(device, root_signature, get_rayquery_shader());
+ 
++    if (mode == TEST_MODE_FINAL_UPDATE_IN_PLACE)
++        update_mode = RT_UPDATE_FINAL_IN_PLACE;
++    else if (mode == TEST_MODE_FINAL_UPDATE_OUT_OF_PLACE)
++        update_mode = RT_UPDATE_FINAL_OUT_OF_PLACE;
++    else
++        update_mode = RT_UPDATE_ALLOW;
++
+     init_test_geometry(device, &test_geom);
+     init_rt_geometry(&context, &test_rtases, &test_geom,
+             NUM_GEOM_DESC, GEOM_OFFSET_X,
+-            NUM_UNMASKED_INSTANCES, INSTANCE_GEOM_SCALE, INSTANCE_OFFSET_Y, 0);
++            NUM_UNMASKED_INSTANCES, INSTANCE_GEOM_SCALE, INSTANCE_OFFSET_Y, 0, update_mode);
+ 
+     {
+         /* For test, we want to hit miss shader, then hit group indices in order. */
+@@ -2335,6 +2433,8 @@ static void test_rayquery(bool root_table)
+         { TEST_MODE_TRACE_RAY_FORCE_NON_OPAQUE, "TraceRayForceNonOpaque" },
+         { TEST_MODE_TRACE_RAY_SKIP_TRIANGLES, "TraceRaySkipTriangles" },
+         { TEST_MODE_TRACE_RAY_SKIP_AABBS, "TraceRaySkipAABBs" },
++        { TEST_MODE_FINAL_UPDATE_IN_PLACE, "FinalUpdateInPlace" },
++        { TEST_MODE_FINAL_UPDATE_OUT_OF_PLACE, "FinalUpdateOutOfPlace" },
+     };
+ 
+     unsigned int i;
+@@ -2383,7 +2483,7 @@ static void test_raytracing_local_rs_static_sampler_inner(bool use_libraries)
+ 
+     init_test_geometry(device, &test_geom);
+     init_rt_geometry(&context, &test_rtases, &test_geom,
+-            2, 10.0f, 2, 1.0f, 10.0f, 0);
++            2, 10.0f, 2, 1.0f, 10.0f, 0, RT_UPDATE_ALLOW);
+ 
+     /* Global root signature */
+     {
+@@ -3861,7 +3961,7 @@ void test_raytracing_mismatch_global_rs_link(void)
+     init_test_geometry(device, &test_geom);
+     init_rt_geometry(&context, &test_rtases, &test_geom,
+         NUM_GEOM_DESC, GEOM_OFFSET_X,
+-        NUM_UNMASKED_INSTANCES, INSTANCE_GEOM_SCALE, INSTANCE_OFFSET_Y, 0);
++        NUM_UNMASKED_INSTANCES, INSTANCE_GEOM_SCALE, INSTANCE_OFFSET_Y, 0, RT_UPDATE_ALLOW);
+ 
+     memset(&rs_desc, 0, sizeof(rs_desc));
+     memset(rs_params, 0, sizeof(rs_params));

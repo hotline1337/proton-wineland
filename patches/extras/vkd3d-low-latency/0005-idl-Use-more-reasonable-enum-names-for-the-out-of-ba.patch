@@ -1,0 +1,42 @@
+From dfe475be0ba8a83ecb48049bf1f22cc96c7a9ffd Mon Sep 17 00:00:00 2001
+From: Hans-Kristian Arntzen <post@arntzen-software.no>
+Date: Wed, 26 Aug 2026 13:15:20 +0200
+Subject: [PATCH 05/19] idl: Use more reasonable enum names for the out of band
+ types.
+
+Only used by internal include, so shouldn't break anything.
+
+Signed-off-by: Hans-Kristian Arntzen <post@arntzen-software.no>
+---
+ include/vkd3d_vk_includes.h          | 4 ++--
+ libs/vkd3d/command_queue_vkd3d_ext.c | 2 +-
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/include/vkd3d_vk_includes.h b/include/vkd3d_vk_includes.h
+index 8e5a2f46..02b1117d 100644
+--- a/include/vkd3d_vk_includes.h
++++ b/include/vkd3d_vk_includes.h
+@@ -50,8 +50,8 @@ typedef enum D3D12_VK_EXTENSION
+ 
+ typedef enum D3D12_OUT_OF_BAND_CQ_TYPE
+ {
+-    OUT_OF_BAND_RENDER  = 0,
+-    OUT_OF_BAND_PRESENT = 1
++    D3D12_OUT_OF_BAND_CQ_TYPE_RENDER  = 0,
++    D3D12_OUT_OF_BAND_CQ_TYPE_PRESENT = 1
+ } D3D12_OUT_OF_BAND_CQ_TYPE;
+ 
+ typedef struct D3D12_CUBIN_DATA_HANDLE
+diff --git a/libs/vkd3d/command_queue_vkd3d_ext.c b/libs/vkd3d/command_queue_vkd3d_ext.c
+index e318dc63..95a96172 100644
+--- a/libs/vkd3d/command_queue_vkd3d_ext.c
++++ b/libs/vkd3d/command_queue_vkd3d_ext.c
+@@ -63,7 +63,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_queue_vkd3d_ext_NotifyOutOfBandCo
+     if (!command_queue->device->vk_info.NV_low_latency2)
+         return E_NOTIMPL;
+ 
+-    if (type != OUT_OF_BAND_RENDER && type != OUT_OF_BAND_PRESENT)
++    if (type != D3D12_OUT_OF_BAND_CQ_TYPE_RENDER && type != D3D12_OUT_OF_BAND_CQ_TYPE_PRESENT)
+         return E_INVALIDARG;
+ 
+     vk_queue_type = (VkOutOfBandQueueTypeNV)type;

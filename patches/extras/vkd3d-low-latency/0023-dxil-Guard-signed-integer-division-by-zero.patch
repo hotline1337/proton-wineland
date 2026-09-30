@@ -1,0 +1,247 @@
+From 715a60bd4539c6e4ffbb2627675c44219ade7431 Mon Sep 17 00:00:00 2001
+From: Jose Fernandez <me@jrfernandez.com>
+Date: Sun, 6 Sep 2026 19:11:38 -0600
+Subject: [PATCH 23/24] dxil: Guard signed integer division by zero.
+
+Comment (Hans-Kristian): It has not been confirmed yet that this
+analysis is real. sdiv/srem behavior has been confirmed against native D3D12 drivers
+however.
+
+The Witcher 3 with ray tracing halts the GPU on NVIDIA a few
+seconds into every world load. On vkd3d-proton 3.0.1 every crash
+dump taken at the hang (Nsight Aftermath, RTX 5090, 610.57.04)
+shows the same thing, every running thread group inside one loop of
+one compute shader and none at the division just before it.
+Simplified, the shader is:
+
+  stride = m / n;                         /* line 205, n is 0 here */
+  for (i = 0; i != n; i++)                /* should run zero times */
+      list[base + i] = (i * stride) % m;  /* lines 221 to 225 */
+
+Where the thread groups were. The other dumps look the same:
+
+  warps  PC            SPIR-V
+     23  0x8a0..0xa90  221  %155 = OpSRem %uint %154 %152
+      1  0xa70         222  %156 = OpIAdd %uint %147 %138
+      7  0x870..0xb20  225  OpStore %157 %158 Aligned 8
+      0                205  %136 = OpSDiv %uint %130 %124
+
+n is a signed per-probe ray count. Reducing the shader to a few
+lines and varying one thing at a time showed why the loop runs:
+once the compiler has seen x / n it behaves as if n != 0, so the
+loop loses its entry check, and with n really zero it runs until i
+wraps around. Adding an explicit if (n != 0) around the loop does
+not help, the compiler removes that check the same way.
+
+build_udiv_umod already guards udiv and urem against exactly this.
+But sdiv and srem are still emitted bare. Move them to
+emit_integer_division_instruction, where udiv and urem already get
+the helper. It branches on a zero divisor and returns -1, so the
+division is never reached with a zero and the compiler cannot
+conclude anything about n. Sign extension of narrow operands was
+added there as needed. With this change the game no longer hangs.
+
+Assisted-by: Claude:claude-fable-5-1
+---
+ opcodes/opcodes_llvm_builtins.cpp           | 60 +++++++++++++--------
+ shaders/llvm-builtin/sdiv-by-zero-loop.comp | 17 ++++++
+ spirv_module.cpp                            | 25 +++++++--
+ spirv_module.hpp                            |  4 +-
+ 4 files changed, 81 insertions(+), 25 deletions(-)
+ create mode 100644 shaders/llvm-builtin/sdiv-by-zero-loop.comp
+
+diff --git a/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.cpp b/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.cpp
+index d3d7615d..257da166 100644
+--- a/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.cpp
++++ b/subprojects/dxil-spirv/opcodes/opcodes_llvm_builtins.cpp
+@@ -347,21 +347,29 @@ static spv::Id emit_integer_division_instruction(Converter::Impl &impl, const In
+ {
+ 	auto &builder = impl.builder();
+ 
+-	// UDiv and UMod have special behaviour regarding division by 0: At the HLSL
++	// Integer division has special behaviour regarding division by 0: At the HLSL
+ 	// and LLVM IR level, division by 0 is undefined behaviour and compilers may
+-	// optimize assuming that the divisor is non-zero. Any UDiv or URem in the
+-	// IR itself however behaves like DXBC when 0 is encountered, i.e. the result
++	// optimize assuming that the divisor is non-zero. Any division in the IR
++	// itself however behaves like DXBC when 0 is encountered, i.e. the result
+ 	// is -1.
+ 	//
+-	// In SPIR-V, UDiv and UMod by zero also constitute undefined behaviour, and
+-	// at least Nvidia drivers will optimize. Any solution that ensures the
++	// In SPIR-V, integer division by zero also constitutes undefined behaviour,
++	// and at least Nvidia drivers will optimize. Any solution that ensures the
+ 	// divisor cannot be zero works, but since we have no easy way to insert control
+ 	// flow here, simply set the divisor to -1.
+ 	//
+-	// This does explicitly *not* apply to the signed variants.
+-	//
+ 	// See: https://github.com/microsoft/DirectXShaderCompiler/issues/3150
+ 	auto divisor = instruction->getOperand(1);
++	bool is_signed = opcode == spv::OpSDiv || opcode == spv::OpSRem;
++
++	// Signed division is width sensitive. Sign-extend odd widths first.
++	const auto operand_id = [&](unsigned index) -> spv::Id
++	{
++		if (is_signed)
++			return build_naturally_extended_value(impl, instruction->getOperand(index), true);
++		else
++			return impl.get_id_for_value(instruction->getOperand(index));
++	};
+ 
+ 	// No need to add any extra code for instructions that have a constant
+ 	// divisor that isn't zero
+@@ -371,8 +379,8 @@ static spv::Id emit_integer_division_instruction(Converter::Impl &impl, const In
+ 	if (is_constant_divisor && llvm::cast<llvm::ConstantInt>(divisor)->getUniqueInteger().getZExtValue())
+ 	{
+ 		auto op = impl.allocate(opcode, instruction);
+-		op->add_id(impl.get_id_for_value(instruction->getOperand(0)));
+-		op->add_id(impl.get_id_for_value(instruction->getOperand(1)));
++		op->add_id(operand_id(0));
++		op->add_id(operand_id(1));
+ 		impl.add(op);
+ 		return op->id;
+ 	}
+@@ -395,8 +403,24 @@ static spv::Id emit_integer_division_instruction(Converter::Impl &impl, const In
+ 		}
+ 	}
+ 
+-	spv::Id call_id = impl.spirv_module.get_helper_call_id(opcode == spv::OpUDiv ? HelperCall::UDiv : HelperCall::UMod,
+-	                                                       impl.get_type_id(instruction->getType()));
++	HelperCall helper;
++	switch (opcode)
++	{
++	case spv::OpUDiv:
++		helper = HelperCall::UDiv;
++		break;
++	case spv::OpUMod:
++		helper = HelperCall::UMod;
++		break;
++	case spv::OpSDiv:
++		helper = HelperCall::SDiv;
++		break;
++	default:
++		helper = HelperCall::SRem;
++		break;
++	}
++
++	spv::Id call_id = impl.spirv_module.get_helper_call_id(helper, impl.get_type_id(instruction->getType()));
+ 
+ 	Operation *call;
+ 	if (llvm::isa<llvm::ConstantExpr>(instruction))
+@@ -405,8 +429,8 @@ static spv::Id emit_integer_division_instruction(Converter::Impl &impl, const In
+ 		call = impl.allocate(spv::OpFunctionCall, instruction);
+ 
+ 	call->add_id(call_id);
+-	call->add_id(impl.get_id_for_value(instruction->getOperand(0)));
+-	call->add_id(impl.get_id_for_value(instruction->getOperand(1)));
++	call->add_id(operand_id(0));
++	call->add_id(operand_id(1));
+ 	impl.add(call);
+ 
+ 	return call->id;
+@@ -483,10 +507,7 @@ static spv::Id emit_binary_instruction_impl(Converter::Impl &impl, const Instruc
+ 		break;
+ 
+ 	case llvm::BinaryOperator::BinaryOps::SDiv:
+-		opcode = spv::OpSDiv;
+-		signed_input = true;
+-		is_width_sensitive = true;
+-		break;
++		return emit_integer_division_instruction(impl, instruction, spv::OpSDiv);
+ 
+ 	case llvm::BinaryOperator::BinaryOps::UDiv:
+ 		return emit_integer_division_instruction(impl, instruction, spv::OpUDiv);
+@@ -507,10 +528,7 @@ static spv::Id emit_binary_instruction_impl(Converter::Impl &impl, const Instruc
+ 		break;
+ 
+ 	case llvm::BinaryOperator::BinaryOps::SRem:
+-		opcode = spv::OpSRem;
+-		signed_input = true;
+-		is_width_sensitive = true;
+-		break;
++		return emit_integer_division_instruction(impl, instruction, spv::OpSRem);
+ 
+ 	case llvm::BinaryOperator::BinaryOps::FRem:
+ 		opcode = spv::OpFRem;
+diff --git a/subprojects/dxil-spirv/shaders/llvm-builtin/sdiv-by-zero-loop.comp b/subprojects/dxil-spirv/shaders/llvm-builtin/sdiv-by-zero-loop.comp
+new file mode 100644
+index 00000000..7a52a340
+--- /dev/null
++++ b/subprojects/dxil-spirv/shaders/llvm-builtin/sdiv-by-zero-loop.comp
+@@ -0,0 +1,17 @@
++RWStructuredBuffer<int> Buf : register(u0);
++
++cbuffer Params : register(b0)
++{
++	int n;
++};
++
++// A zero divisor, consumed only by a loop the same zero should skip.
++// Drivers may infer n != 0 from the division and drop the loop check.
++[numthreads(32, 1, 1)]
++void main(uint3 tid : SV_DispatchThreadID)
++{
++	int stride = 65536 / n;
++	int rem = 65536 % n;
++	for (int i = 0; i != n; i++)
++		Buf[tid.x + i] = stride + rem;
++}
+diff --git a/subprojects/dxil-spirv/spirv_module.cpp b/subprojects/dxil-spirv/spirv_module.cpp
+index 732508eb..03e03d83 100644
+--- a/subprojects/dxil-spirv/spirv_module.cpp
++++ b/subprojects/dxil-spirv/spirv_module.cpp
+@@ -2211,9 +2211,24 @@ spv::Id SPIRVModule::Impl::build_udiv_umod(SPIRVModule &module, spv::Id type_id,
+ 	auto *current_build_point = builder.getBuildPoint();
+ 	spv::Block *entry = nullptr;
+ 
+-	auto *func = builder.makeFunctionEntry(spv::NoPrecision, type_id,
+-	                                       op == spv::OpUDiv ? "UDiv" : "UMod",
+-	                                       {type_id, type_id}, {}, &entry);
++	const char *name;
++	switch (op)
++	{
++	case spv::OpUDiv:
++		name = "UDiv";
++		break;
++	case spv::OpUMod:
++		name = "UMod";
++		break;
++	case spv::OpSDiv:
++		name = "SDiv";
++		break;
++	default:
++		name = "SRem";
++		break;
++	}
++
++	auto *func = builder.makeFunctionEntry(spv::NoPrecision, type_id, name, { type_id, type_id }, {}, &entry);
+ 
+ 	builder.addName(func->getParamId(0), "num");
+ 	builder.addName(func->getParamId(1), "den");
+@@ -3086,6 +3101,10 @@ spv::Id SPIRVModule::Impl::get_helper_call_id(SPIRVModule &module, HelperCall ca
+ 		return build_udiv_umod(module, type_id, spv::OpUDiv);
+ 	case HelperCall::UMod:
+ 		return build_udiv_umod(module, type_id, spv::OpUMod);
++	case HelperCall::SDiv:
++		return build_udiv_umod(module, type_id, spv::OpSDiv);
++	case HelperCall::SRem:
++		return build_udiv_umod(module, type_id, spv::OpSRem);
+ 
+ 	default:
+ 		break;
+diff --git a/subprojects/dxil-spirv/spirv_module.hpp b/subprojects/dxil-spirv/spirv_module.hpp
+index c86548bb..d4e1e62e 100644
+--- a/subprojects/dxil-spirv/spirv_module.hpp
++++ b/subprojects/dxil-spirv/spirv_module.hpp
+@@ -86,7 +86,9 @@ enum class HelperCall
+ 	CoopMatSaturateFP8,
+ 	ByteAddressMask,
+ 	UDiv,
+-	UMod
++	UMod,
++	SDiv,
++	SRem
+ };
+ 
+ enum class BDAOperation

@@ -1,0 +1,34 @@
+From 6d94f4477e63972cf771e1b66c953d281657c141 Mon Sep 17 00:00:00 2001
+From: Hans-Kristian Arntzen <post@arntzen-software.no>
+Date: Mon, 21 Sep 2026 18:52:23 +0200
+Subject: [PATCH 10/19] tests: Add a small check that we're not getting
+ serialized behavior.
+
+A valid native implementation might be to serialize the queues.
+Demonstrate that's not what happens in real world.
+
+Signed-off-by: Hans-Kristian Arntzen <post@arntzen-software.no>
+---
+ tests/d3d12_sync.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/tests/d3d12_sync.c b/tests/d3d12_sync.c
+index 64ddb190..2c99e954 100644
+--- a/tests/d3d12_sync.c
++++ b/tests/d3d12_sync.c
+@@ -2346,6 +2346,15 @@ static void test_fence_signal_order_raced_signal_inner(bool use_shared)
+         exec_command_list(queue_b, list_short);
+         ID3D12CommandQueue_Signal(queue_b, fence, 1);
+ 
++        ok(SUCCEEDED(wait_for_fence_no_event(fence, 1)), "Unexpected failure waiting for fence.\n");
++
++        /* It's overwhelmingly likely that fence_alt is not signaled yet. */
++        if (ID3D12Fence_GetCompletedValue(fence_alt) == 1)
++        {
++            skip("Unexpected fence_alt == 1 observed. Not impossible in a valid implementation. "
++                 "If queues are truly async, this is extremely unlikely to actually happen.\n");
++        }
++
+         if (wait_event(event, 1000) == WAIT_OBJECT_0)
+         {
+             valid = ID3D12Fence_GetCompletedValue(fence_alt) == 1;

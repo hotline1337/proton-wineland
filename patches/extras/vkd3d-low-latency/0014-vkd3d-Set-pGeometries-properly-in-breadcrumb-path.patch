@@ -1,0 +1,36 @@
+From e057e524d77bacd71dbb819266f4ba66613cc279 Mon Sep 17 00:00:00 2001
+From: Hans-Kristian Arntzen <post@arntzen-software.no>
+Date: Mon, 3 Aug 2026 14:48:14 +0200
+Subject: [PATCH 14/19] vkd3d: Set pGeometries properly in breadcrumb path.
+
+Signed-off-by: Hans-Kristian Arntzen <post@arntzen-software.no>
+---
+ libs/vkd3d/command.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 02b90b5d..9c29910e 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -20538,6 +20538,10 @@ static void d3d12_command_list_build_raytracing_opacity_micromap_array(struct d3
+ 
+             memset(&size_info, 0, sizeof(size_info));
+             size_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
++
++            /* These pointers are normally not set until flush. */
++            build_info->pGeometries = geometry_info;
++
+             VK_CALL(vkGetAccelerationStructureBuildSizesKHR(list->device->vk_device,
+                     VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, build_info, NULL, &size_info));
+ 
+@@ -20674,6 +20678,10 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
+                 build_info->mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+                 build_info->flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+             }
++
++            /* These pointers are normally not set until flush. */
++            build_info->pGeometries = geometry_infos;
++
+             VK_CALL(vkGetAccelerationStructureBuildSizesKHR(list->device->vk_device,
+                     VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, build_info,
+                     primitive_counts, &size_info));

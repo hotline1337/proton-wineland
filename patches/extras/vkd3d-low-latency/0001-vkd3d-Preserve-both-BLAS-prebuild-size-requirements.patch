@@ -1,0 +1,387 @@
+From 4d0a5cbf0d4922eb424b812ffdb57617b4a52453 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Tue, 29 Sep 2026 18:52:30 +0200
+Subject: [PATCH 1/2] vkd3d: Preserve both BLAS prebuild size requirements.
+
+Query both flag variants for the rebuild-size workaround. ALLOW_UPDATE
+is not guaranteed to increase result or build scratch requirements.
+Take update scratch only from the ALLOW_UPDATE query and preserve the
+existing conservative scratch policy. Avoid redundant queries.
+
+Add deterministic tests for shrinking and mixed sizes, irrelevant
+update sizes, and unchanged query paths.
+---
+ libs/vkd3d/device.c         |  35 +++--
+ tests/rtas_prebuild_test.py | 299 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 319 insertions(+), 15 deletions(-)
+ create mode 100644 tests/rtas_prebuild_test.py
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 3b83b153..27550754 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -1,4 +1,6 @@
+ /*
++ * Salkim modifications by Erhan Bilgili on 2026-09-30.
++ *
+  * Copyright 2016 Józef Kucia for CodeWeavers
+  *
+  * This library is free software; you can redistribute it and/or
+@@ -8826,12 +8828,6 @@ static void STDMETHODCALLTYPE d3d12_device_GetRaytracingAccelerationStructurePre
+         goto cleanup;
+     }
+ 
+-    if (build_info.type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR &&
+-        VKD3D_CONFIG_FLAG_IS_SET(RTAS_ALLOW_BLAS_REBUILD_SIZES))
+-    {
+-        build_info.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+-    }
+-
+     build_info.pGeometries = geometries;
+ 
+     memset(&size_info, 0, sizeof(size_info));
+@@ -8841,21 +8837,30 @@ static void STDMETHODCALLTYPE d3d12_device_GetRaytracingAccelerationStructurePre
+             VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build_info,
+             primitive_counts, &size_info));
+ 
+-    /* An assumption is made here where RTAS_ALLOW_REBUILD_SIZES config will not make the required RTAS size smaller. */
+     info->ResultDataMaxSizeInBytes = size_info.accelerationStructureSize;
+     info->ScratchDataSizeInBytes = size_info.buildScratchSize;
++    info->UpdateScratchDataSizeInBytes = size_info.updateScratchSize;
+ 
+     if (build_info.type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR &&
+         VKD3D_CONFIG_FLAG_IS_SET(RTAS_ALLOW_BLAS_REBUILD_SIZES))
+     {
+-        /* Pick the conservative result. */
+-        info->ScratchDataSizeInBytes = max(size_info.buildScratchSize, size_info.updateScratchSize);
+-        info->UpdateScratchDataSizeInBytes = max(size_info.buildScratchSize, size_info.updateScratchSize);
+-    }
+-    else
+-    {
+-        /* Default API path. */
+-        info->UpdateScratchDataSizeInBytes = size_info.updateScratchSize;
++        if (!(build_info.flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR))
++        {
++            /* ALLOW_UPDATE is not guaranteed to increase any of the reported sizes. */
++            build_info.flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
++            VK_CALL(vkGetAccelerationStructureBuildSizesKHR(device->vk_device,
++                    VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build_info,
++                    primitive_counts, &size_info));
++
++            info->ResultDataMaxSizeInBytes = max(info->ResultDataMaxSizeInBytes, size_info.accelerationStructureSize);
++            info->ScratchDataSizeInBytes = max(info->ScratchDataSizeInBytes, size_info.buildScratchSize);
++            /* Only the ALLOW_UPDATE query describes a valid update operation. */
++            info->UpdateScratchDataSizeInBytes = size_info.updateScratchSize;
++        }
++
++        /* Either path may be used for a rebuild, so reserve enough scratch for both. */
++        info->ScratchDataSizeInBytes = max(info->ScratchDataSizeInBytes, info->UpdateScratchDataSizeInBytes);
++        info->UpdateScratchDataSizeInBytes = info->ScratchDataSizeInBytes;
+     }
+ 
+     TRACE("ResultDataMaxSizeInBytes: %"PRIu64".\n", info->ResultDataMaxSizeInBytes);
+diff --git a/tests/rtas_prebuild_test.py b/tests/rtas_prebuild_test.py
+new file mode 100644
+index 00000000..ccdac7c3
+--- /dev/null
++++ b/tests/rtas_prebuild_test.py
+@@ -0,0 +1,299 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: LGPL-2.1-or-later
++"""Exercise the production prebuild-info method with deterministic Vulkan replies.
++
++No GPU or configured build tree is required. Only the surrounding device/input
++plumbing is stubbed; the method itself is extracted unchanged from device.c.
++This allows testing drivers whose ALLOW_UPDATE sizes shrink, independent of the
++installed driver. --revision can check that an older implementation fails.
++
++Example:
++    python3 tests/rtas_prebuild_test.py --output-dir /path/to/test-artifacts
++"""
++
++import argparse
++import os
++from pathlib import Path
++import re
++import shlex
++import subprocess
++
++
++PREFIX = r'''
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <vulkan/vulkan.h>
++
++#define STDMETHODCALLTYPE
++#define TRACE(...) ((void)0)
++#define ERR(...) ((void)0)
++#define VKD3D_BUILD_INFO_STACK_COUNT 16
++#define VK_CALL(f) (vk_procs->f)
++#define VKD3D_CONFIG_FLAG_IS_SET(flag) (rebuild_sizes)
++#define max(a, b) ((a) > (b) ? (a) : (b))
++#define vkd3d_malloc malloc
++#define vkd3d_free free
++#define D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP_ARRAY 2
++
++typedef struct
++{
++    uint32_t Type;
++    VkBuildAccelerationStructureFlagsKHR Flags;
++    uint32_t NumDescs;
++} D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS;
++
++typedef struct
++{
++    uint64_t ResultDataMaxSizeInBytes;
++    uint64_t ScratchDataSizeInBytes;
++    uint64_t UpdateScratchDataSizeInBytes;
++} D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO;
++
++struct vkd3d_vk_device_procs
++{
++    PFN_vkGetAccelerationStructureBuildSizesKHR vkGetAccelerationStructureBuildSizesKHR;
++};
++
++struct d3d12_device
++{
++    VkDevice vk_device;
++    struct vkd3d_vk_device_procs vk_procs;
++};
++
++typedef struct d3d12_device d3d12_device_iface;
++
++static bool rebuild_sizes;
++
++static struct d3d12_device *impl_from_ID3D12Device(d3d12_device_iface *iface)
++{
++    return iface;
++}
++
++static bool d3d12_device_supports_ray_tracing_tier_1_0(struct d3d12_device *device)
++{
++    return true;
++}
++
++static void d3d12_device_get_raytracing_opacity_micromap_array_prebuild_info(
++        struct d3d12_device *device,
++        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc,
++        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO *info)
++{
++    abort(); /* None of these cases may enter the opacity micromap path. */
++}
++
++static uint32_t vkd3d_acceleration_structure_get_geometry_count(
++        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc)
++{
++    return desc->NumDescs;
++}
++
++static bool vkd3d_acceleration_structure_convert_inputs(struct d3d12_device *device,
++        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS *desc,
++        VkAccelerationStructureBuildGeometryInfoKHR *build_info,
++        VkAccelerationStructureGeometryKHR *geometries,
++        VkAccelerationStructureTrianglesOpacityMicromapKHR *omm_triangles_infos,
++        void *ranges, uint32_t *primitive_counts)
++{
++    uint32_t i;
++
++    memset(build_info, 0, sizeof(*build_info));
++    build_info->sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
++    build_info->type = desc->Type;
++    build_info->flags = desc->Flags;
++    build_info->mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
++    build_info->geometryCount = desc->NumDescs;
++    memset(geometries, 0, sizeof(*geometries) * desc->NumDescs);
++    for (i = 0; i < desc->NumDescs; i++)
++        primitive_counts[i] = i + 1;
++    return true;
++}
++'''
++
++
++SUFFIX = r'''
++struct sizes
++{
++    uint64_t result;
++    uint64_t build;
++    uint64_t update;
++};
++
++struct test_case
++{
++    const char *name;
++    bool profile;
++    VkAccelerationStructureTypeKHR type;
++    VkBuildAccelerationStructureFlagsKHR flags;
++    uint32_t geometry_count;
++    unsigned int query_count;
++    struct sizes replies[2];
++    struct sizes expected;
++};
++
++static const struct test_case *current;
++static unsigned int query_count, failures;
++static VkAccelerationStructureBuildGeometryInfoKHR first_query;
++static const uint32_t *first_primitive_counts;
++
++#define check(condition, message) do { \
++    if (!(condition)) { \
++        fprintf(stderr, "%s: %s\n", current->name, message); \
++        failures++; \
++    } \
++} while (0)
++
++static VKAPI_ATTR void VKAPI_CALL mock_get_build_sizes(VkDevice device,
++        VkAccelerationStructureBuildTypeKHR build_type,
++        const VkAccelerationStructureBuildGeometryInfoKHR *build_info,
++        const uint32_t *primitive_counts, VkAccelerationStructureBuildSizesInfoKHR *sizes)
++{
++    VkBuildAccelerationStructureFlagsKHR expected_flags = current->flags;
++    const struct sizes *reply;
++    unsigned int index = query_count++;
++    uint32_t i;
++
++    check(index < current->query_count, "unexpected extra sizing query");
++    if (index >= 2)
++        abort();
++    if (index)
++        expected_flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
++    check(build_info->flags == expected_flags, "wrong sizing query flags or query order");
++    check(build_type == VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, "wrong build type");
++    check(build_info->sType == VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
++            "wrong build info structure type");
++    check(build_info->type == current->type, "wrong acceleration structure type");
++    check(build_info->mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR, "wrong build mode");
++    check(build_info->geometryCount == current->geometry_count, "wrong geometry count");
++    check(build_info->pGeometries != NULL, "missing geometries");
++    check(sizes->sType == VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR,
++            "wrong size info structure type");
++    check(sizes->pNext == NULL, "unexpected size info extension");
++    for (i = 0; i < current->geometry_count; i++)
++        check(primitive_counts[i] == i + 1, "primitive counts changed");
++
++    if (!index)
++    {
++        first_query = *build_info;
++        first_primitive_counts = primitive_counts;
++    }
++    else
++    {
++        check(build_info->pGeometries == first_query.pGeometries, "geometry storage changed between queries");
++        check(primitive_counts == first_primitive_counts, "primitive count storage changed between queries");
++    }
++
++    /* Model the driver reply by flags, including an implementation that skips the original query. */
++    reply = &current->replies[build_info->flags != current->flags];
++    sizes->accelerationStructureSize = reply->result;
++    sizes->buildScratchSize = reply->build;
++    sizes->updateScratchSize = reply->update;
++}
++
++#define BLAS VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR
++#define TLAS VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR
++#define UPDATE VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR
++#define TRACE_FAST VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR
++
++int main(void)
++{
++    static const struct test_case tests[] =
++    {
++        {"profile off BLAS", false, BLAS, TRACE_FAST, 3, 1,
++            {{4096, 1024, 0}}, {4096, 1024, 0}},
++        {"profile off updatable BLAS", false, BLAS, UPDATE | TRACE_FAST, 3, 1,
++            {{4096, 1024, 2048}}, {4096, 1024, 2048}},
++        {"profile off TLAS", false, TLAS, TRACE_FAST, 1, 1,
++            {{4096, 1024, 2048}}, {4096, 1024, 2048}},
++        {"profile on TLAS", true, TLAS, TRACE_FAST, 1, 1,
++            {{4096, 1024, 2048}}, {4096, 1024, 2048}},
++        {"profile on updatable TLAS", true, TLAS, UPDATE | TRACE_FAST, 1, 1,
++            {{4096, 1024, 2048}}, {4096, 1024, 2048}},
++        {"already updatable BLAS, update scratch larger", true, BLAS, UPDATE | TRACE_FAST, 3, 1,
++            {{4096, 1024, 2048}}, {4096, 2048, 2048}},
++        {"already updatable BLAS, build scratch larger", true, BLAS, UPDATE, 3, 1,
++            {{4096, 2048, 1024}}, {4096, 2048, 2048}},
++        {"ALLOW_UPDATE shrinks result and build scratch", true, BLAS, TRACE_FAST, 3, 2,
++            {{8192, 4096, 2048}, {1024, 512, 256}}, {8192, 4096, 4096}},
++        {"ignore non-updatable query update scratch", true, BLAS, 0, 3, 2,
++            {{8192, 2048, 4096}, {1024, 512, 256}}, {8192, 2048, 2048}},
++        {"ignore extreme non-updatable query update scratch", true, BLAS, TRACE_FAST, 3, 2,
++            {{8192, 512, UINT64_MAX}, {4096, 1024, 2048}}, {8192, 2048, 2048}},
++        {"zero scratch requirements", true, BLAS, 0, 3, 2,
++            {{8192, 0, UINT64_MAX}, {4096, 0, 0}}, {8192, 0, 0}},
++        {"zero update scratch preserves build requirements", true, BLAS, 0, 3, 2,
++            {{8192, 2048, UINT64_MAX}, {4096, 1024, 0}}, {8192, 2048, 2048}},
++        {"ALLOW_UPDATE increases result and build scratch", true, BLAS, TRACE_FAST, 3, 2,
++            {{1024, 512, 256}, {8192, 4096, 2048}}, {8192, 4096, 4096}},
++        {"ALLOW_UPDATE increases result but shrinks build scratch", true, BLAS, TRACE_FAST, 3, 2,
++            {{8192, 4096, 0}, {16384, 1024, 2048}}, {16384, 4096, 4096}},
++        {"ALLOW_UPDATE shrinks result but increases update scratch", true, BLAS, TRACE_FAST, 3, 2,
++            {{8192, 512, 256}, {1024, 2048, 4096}}, {8192, 4096, 4096}},
++        {"64-bit sizes and heap geometry storage", true, BLAS, TRACE_FAST,
++            VKD3D_BUILD_INFO_STACK_COUNT + 1, 2,
++            {{1ull << 35, 1ull << 33, 1ull << 32}, {1ull << 34, 1ull << 32, 1ull << 34}},
++            {1ull << 35, 1ull << 34, 1ull << 34}},
++        {"identical sizes", true, BLAS, TRACE_FAST, 3, 2,
++            {{4096, 1024, 2048}, {4096, 1024, 2048}}, {4096, 2048, 2048}},
++    };
++    struct d3d12_device device = {0};
++    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS desc;
++    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info;
++    unsigned int i;
++
++    device.vk_procs.vkGetAccelerationStructureBuildSizesKHR = mock_get_build_sizes;
++    for (i = 0; i < sizeof(tests) / sizeof(tests[0]); i++)
++    {
++        current = &tests[i];
++        rebuild_sizes = current->profile;
++        query_count = 0;
++        desc.Type = current->type;
++        desc.Flags = current->flags;
++        desc.NumDescs = current->geometry_count;
++        memset(&info, 0xcc, sizeof(info));
++        d3d12_device_GetRaytracingAccelerationStructurePrebuildInfo(&device, &desc, &info);
++        check(query_count == current->query_count, "wrong number of sizing queries");
++        check(info.ResultDataMaxSizeInBytes == current->expected.result, "wrong result size");
++        check(info.ScratchDataSizeInBytes == current->expected.build, "wrong build scratch size");
++        check(info.UpdateScratchDataSizeInBytes == current->expected.update, "wrong update scratch size");
++        check(desc.Flags == current->flags, "application flags were modified");
++    }
++
++    printf("%u prebuild sizing cases, %u failures\n", i, failures);
++    return failures ? EXIT_FAILURE : EXIT_SUCCESS;
++}
++'''
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--output-dir", type=Path, required=True)
++    parser.add_argument("--revision", help="Read device.c from this git revision instead of the worktree")
++    parser.add_argument("--cc", default=os.environ.get("CC", "cc"))
++    args = parser.parse_args()
++    root = Path(__file__).resolve().parent.parent
++    if args.revision:
++        source = subprocess.check_output(
++            ["git", "show", f"{args.revision}:libs/vkd3d/device.c"], cwd=root, text=True)
++    else:
++        source = (root / "libs/vkd3d/device.c").read_text()
++    match = re.search(
++        r"^static void STDMETHODCALLTYPE d3d12_device_GetRaytracingAccelerationStructurePrebuildInfo\(.*?^}",
++        source, re.MULTILINE | re.DOTALL)
++    if not match:
++        raise RuntimeError("Could not find the production prebuild-info method")
++
++    args.output_dir.mkdir(parents=True, exist_ok=True)
++    binary = args.output_dir.resolve() / "rtas-prebuild-test"
++    subprocess.run(shlex.split(args.cc) + [
++        "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
++        "-I", str(root / "khronos/Vulkan-Headers/include"), "-x", "c", "-",
++        "-o", str(binary)], input=PREFIX + match.group(0) + SUFFIX, text=True, check=True)
++    return subprocess.run([str(binary)]).returncode
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

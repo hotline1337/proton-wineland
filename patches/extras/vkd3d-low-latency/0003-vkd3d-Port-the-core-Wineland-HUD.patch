@@ -1,0 +1,1498 @@
+From 789bad62df6f033754c56448aeca355366bdcca6 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Wed, 30 Sep 2026 11:16:21 +0200
+Subject: [PATCH] vkd3d: Port the core Wineland HUD.
+
+Render DXVK HUD data during presentation, including HDR output, scaled
+layouts, graphs and the current present mode. Keep the frame pacer intact
+and leave presentation-latency telemetry out of this backport.
+
+Bound HUD request-ring reuse so queued vertices remain valid until their
+presentation callback retires. Allocate rendering resources lazily.
+---
+ include/vkd3d_swapchain_factory.idl      |  39 +++-
+ libs/vkd3d/meson.build                   |   3 +
+ libs/vkd3d/meta.c                        | 187 ++++++++++++++++-
+ libs/vkd3d/shaders/fs_swapchain_hud.frag |  97 +++++++++
+ libs/vkd3d/shaders/vs_swapchain_hud.vert |  44 ++++
+ libs/vkd3d/swapchain.c                   | 246 ++++++++++++++++++++---
+ libs/vkd3d/swapchain_hud.c               | 216 ++++++++++++++++++++
+ libs/vkd3d/swapchain_hud.h               |  53 +++++
+ libs/vkd3d/vkd3d_private.h               |  44 ++++
+ libs/vkd3d/vkd3d_shaders.h               |   4 +
+ 10 files changed, 897 insertions(+), 36 deletions(-)
+ create mode 100644 libs/vkd3d/shaders/fs_swapchain_hud.frag
+ create mode 100644 libs/vkd3d/shaders/vs_swapchain_hud.vert
+ create mode 100644 libs/vkd3d/swapchain_hud.c
+ create mode 100644 libs/vkd3d/swapchain_hud.h
+
+diff --git a/include/vkd3d_swapchain_factory.idl b/include/vkd3d_swapchain_factory.idl
+index b62d950a..b306d786 100644
+--- a/include/vkd3d_swapchain_factory.idl
++++ b/include/vkd3d_swapchain_factory.idl
+@@ -1,4 +1,6 @@
+ /*
++ * Wineland HUD modifications by Erhan Bilgili on 2026-09-30.
++ *
+  * Copyright 2020 Joshua Ashton for Valve Software
+  *
+  * This library is free software; you can redistribute it and/or
+@@ -37,6 +39,28 @@ typedef struct DXGI_VK_FRAME_STATISTICS
+     UINT64 PresentQPCTime;
+ } DXGI_VK_FRAME_STATISTICS;
+ 
++typedef struct DXGI_VK_HUD_VERTEX
++{
++    /* Unscaled pixels in the current DXGI backbuffer coordinate space. */
++    FLOAT Position[2];
++    FLOAT Texcoord[2];
++    UINT Color;
++    UINT Padding;
++} DXGI_VK_HUD_VERTEX;
++
++typedef struct DXGI_VK_HUD_DATA
++{
++    UINT StructSize;
++    UINT VertexCount;
++    const DXGI_VK_HUD_VERTEX *pVertices;
++    FLOAT Scale;
++    FLOAT Opacity;
++    UINT FontWidth;
++    UINT FontHeight;
++    UINT FontDataSize;
++    const BYTE *pFontData;
++} DXGI_VK_HUD_DATA;
++
+ [
+     object,
+     local,
+@@ -132,6 +156,20 @@ interface IDXGIVkSwapChain2 : IDXGIVkSwapChain1
+         double                    FrameRate);
+ }
+ 
++[
++    object,
++    local,
++    uuid(e0982f6b-41d7-4a1f-8aa9-cecb15da2360)
++]
++interface IDXGIVkSwapChainHud : IDXGIVkSwapChain2
++{
++    HRESULT SetHudData(
++        const DXGI_VK_HUD_DATA*    pData);
++
++    /* Last successfully submitted VkPresentModeKHR, or MAX_ENUM if unavailable. */
++    UINT GetPresentMode();
++}
++
+ [
+     object,
+     local,
+@@ -143,4 +181,3 @@ interface IDXGIVkSwapChainFactory : IUnknown {
+     const DXGI_SWAP_CHAIN_DESC1*    pDesc,
+           IDXGIVkSwapChain**        ppSwapChain);
+ }
+-
+diff --git a/libs/vkd3d/meson.build b/libs/vkd3d/meson.build
+index c5362d31..02b51deb 100644
+--- a/libs/vkd3d/meson.build
++++ b/libs/vkd3d/meson.build
+@@ -32,6 +32,8 @@ vkd3d_shaders =[
+ 
+   'shaders/vs_swapchain_fullscreen.vert',
+   'shaders/fs_swapchain_fullscreen.frag',
++  'shaders/vs_swapchain_hud.vert',
++  'shaders/fs_swapchain_hud.frag',
+   'shaders/cs_execute_indirect_patch.comp',
+   'shaders/cs_execute_indirect_patch_debug_ring.comp',
+   'shaders/cs_execute_indirect_multi_dispatch.comp',
+@@ -86,6 +88,7 @@ vkd3d_src = [
+   'state_object_common.c',
+   'acceleration_structure.c',
+   'opacity_micromap.c',
++  'swapchain_hud.c',
+   'swapchain.c',
+   'queue_timeline.c',
+   'address_binding_tracker.c',
+diff --git a/libs/vkd3d/meta.c b/libs/vkd3d/meta.c
+index 9be2b2f1..51d01224 100644
+--- a/libs/vkd3d/meta.c
++++ b/libs/vkd3d/meta.c
+@@ -1,4 +1,6 @@
+ /*
++ * Wineland HUD modifications by Erhan Bilgili on 2026-09-30.
++ *
+  * Copyright 2019 Philip Rebohle
+  *
+  * This library is free software; you can redistribute it and/or
+@@ -235,7 +237,8 @@ static VkResult vkd3d_meta_create_graphics_pipeline(struct vkd3d_meta_ops *meta_
+         VkPipelineLayout layout, VkFormat color_format, VkFormat ds_format, VkImageAspectFlags vk_aspect_mask,
+         VkShaderModule vs_module, VkShaderModule fs_module, VkSampleCountFlagBits samples,
+         const VkPipelineDepthStencilStateCreateInfo *ds_state, uint32_t dynamic_state_count, const VkDynamicState *dynamic_states,
+-        const VkSpecializationInfo *spec_info, bool descriptor_buffer_compatible, VkPipeline *vk_pipeline)
++        const VkSpecializationInfo *spec_info, const VkPipelineColorBlendAttachmentState *blend_state,
++        bool descriptor_buffer_compatible, VkPipeline *vk_pipeline)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &meta_ops->device->vk_procs;
+     VkPipelineColorBlendAttachmentState blend_attachment;
+@@ -336,6 +339,9 @@ static VkResult vkd3d_meta_create_graphics_pipeline(struct vkd3d_meta_ops *meta_
+             VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+ 
++    if (blend_state)
++        blend_attachment = *blend_state;
++
+     cb_state.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+     cb_state.pNext = NULL;
+     cb_state.flags = 0;
+@@ -759,7 +765,7 @@ static HRESULT vkd3d_meta_create_swapchain_pipeline(struct vkd3d_meta_ops *meta_
+     if ((vr = vkd3d_meta_create_graphics_pipeline(meta_ops,
+             meta_swapchain_ops->vk_pipeline_layouts[key->filter], key->format, VK_FORMAT_UNDEFINED, VK_IMAGE_ASPECT_COLOR_BIT,
+             meta_swapchain_ops->vk_vs_module, meta_swapchain_ops->vk_fs_module, 1,
+-            NULL, 0, NULL, NULL, false, &pipeline->vk_pipeline)) < 0)
++            NULL, 0, NULL, NULL, NULL, false, &pipeline->vk_pipeline)) < 0)
+         return hresult_from_vk_result(vr);
+ 
+     pipeline->key = *key;
+@@ -877,7 +883,7 @@ static HRESULT vkd3d_meta_create_copy_image_pipeline(struct vkd3d_meta_ops *meta
+             VK_NULL_HANDLE, vk_module, key->sample_count,
+             has_depth_target ? &ds_state : NULL,
+             dynamic_state_count, dynamic_states,
+-            &spec_info, true, &pipeline->vk_pipeline)) < 0)
++            &spec_info, NULL, true, &pipeline->vk_pipeline)) < 0)
+         return hresult_from_vk_result(vr);
+ 
+     pipeline->key = *key;
+@@ -1234,7 +1240,7 @@ static HRESULT vkd3d_meta_create_resolve_image_graphics_pipeline(struct vkd3d_me
+             VK_NULL_HANDLE, vk_module, VK_SAMPLE_COUNT_1_BIT,
+             has_depth_target ? &ds_state : NULL,
+             dynamic_state_count, dynamic_states,
+-            &spec_info, true, &pipeline->vk_pipeline)) < 0)
++            &spec_info, NULL, true, &pipeline->vk_pipeline)) < 0)
+         return hresult_from_vk_result(vr);
+ 
+     memset(&pipeline->key, 0, sizeof(pipeline->key));
+@@ -1550,6 +1556,171 @@ HRESULT vkd3d_meta_get_swapchain_pipeline(struct vkd3d_meta_ops *meta_ops,
+     return S_OK;
+ }
+ 
++static void vkd3d_swapchain_hud_ops_cleanup_resources(struct vkd3d_swapchain_hud_ops *ops,
++        struct d3d12_device *device)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    size_t i;
++
++    for (i = 0; i < ops->pipeline_count; i++)
++        VK_CALL(vkDestroyPipeline(device->vk_device, ops->pipelines[i].vk_pipeline, NULL));
++
++    VK_CALL(vkDestroyShaderModule(device->vk_device, ops->vk_vs_module, NULL));
++    VK_CALL(vkDestroyShaderModule(device->vk_device, ops->vk_fs_module, NULL));
++    VK_CALL(vkDestroyPipelineLayout(device->vk_device, ops->vk_pipeline_layout, NULL));
++    VK_CALL(vkDestroyDescriptorSetLayout(device->vk_device, ops->vk_set_layout, NULL));
++    vkd3d_free(ops->pipelines);
++
++    ops->vk_vs_module = VK_NULL_HANDLE;
++    ops->vk_fs_module = VK_NULL_HANDLE;
++    ops->vk_pipeline_layout = VK_NULL_HANDLE;
++    ops->vk_set_layout = VK_NULL_HANDLE;
++    ops->pipelines = NULL;
++    ops->pipelines_size = 0;
++    ops->pipeline_count = 0;
++}
++
++static void vkd3d_swapchain_hud_ops_cleanup(struct vkd3d_swapchain_hud_ops *ops,
++        struct d3d12_device *device)
++{
++    vkd3d_swapchain_hud_ops_cleanup_resources(ops, device);
++    pthread_mutex_destroy(&ops->mutex);
++}
++
++static HRESULT vkd3d_swapchain_hud_ops_init(struct vkd3d_swapchain_hud_ops *ops)
++{
++    int rc;
++
++    memset(ops, 0, sizeof(*ops));
++
++    if ((rc = pthread_mutex_init(&ops->mutex, NULL)))
++    {
++        ERR("Failed to initialize mutex, error %d.\n", rc);
++        return hresult_from_errno(rc);
++    }
++
++    return S_OK;
++}
++
++static HRESULT vkd3d_swapchain_hud_ops_init_resources(struct vkd3d_swapchain_hud_ops *ops,
++        struct d3d12_device *device)
++{
++    VkDescriptorSetLayoutBinding bindings[2];
++    VkPushConstantRange push_range;
++    VkResult vr;
++
++    if (ops->init_attempted)
++        return ops->init_result;
++
++    ops->init_attempted = true;
++    memset(bindings, 0, sizeof(bindings));
++    bindings[0].binding = 0;
++    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++    bindings[0].descriptorCount = 1;
++    bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
++    bindings[1].binding = 1;
++    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++    bindings[1].descriptorCount = 1;
++    bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
++
++    if ((vr = vkd3d_meta_create_descriptor_set_layout(device, ARRAY_SIZE(bindings), bindings,
++            false, &ops->vk_set_layout)) < 0)
++        goto fail;
++
++    push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
++    push_range.offset = 0;
++    push_range.size = sizeof(struct vkd3d_swapchain_hud_push_constants);
++
++    if ((vr = vkd3d_meta_create_pipeline_layout(device, 1, &ops->vk_set_layout,
++            &push_range, &ops->vk_pipeline_layout)) < 0)
++        goto fail;
++
++    if ((vr = vkd3d_meta_create_shader_module(device,
++            SPIRV_CODE(vs_swapchain_hud), &ops->vk_vs_module)) < 0)
++        goto fail;
++
++    if ((vr = vkd3d_meta_create_shader_module(device,
++            SPIRV_CODE(fs_swapchain_hud), &ops->vk_fs_module)) < 0)
++        goto fail;
++
++    ops->init_result = S_OK;
++    return S_OK;
++
++fail:
++    WARN("Failed to initialize swapchain HUD resources, vr %d.\n", vr);
++    vkd3d_swapchain_hud_ops_cleanup_resources(ops, device);
++    ops->init_result = hresult_from_vk_result(vr);
++    return ops->init_result;
++}
++
++HRESULT vkd3d_meta_get_swapchain_hud_pipeline(struct vkd3d_meta_ops *meta_ops,
++        VkFormat format, struct vkd3d_swapchain_hud_info *info)
++{
++    struct vkd3d_swapchain_hud_ops *ops = &meta_ops->swapchain_hud;
++    VkPipelineColorBlendAttachmentState blend_state;
++    struct vkd3d_swapchain_hud_pipeline *pipeline;
++    HRESULT hr;
++    VkResult vr;
++    size_t i;
++    int rc;
++
++    if ((rc = pthread_mutex_lock(&ops->mutex)))
++        return hresult_from_errno(rc);
++
++    if (FAILED(hr = vkd3d_swapchain_hud_ops_init_resources(ops, meta_ops->device)))
++        goto out;
++
++    info->vk_set_layout = ops->vk_set_layout;
++    info->vk_pipeline_layout = ops->vk_pipeline_layout;
++
++    for (i = 0; i < ops->pipeline_count; i++)
++    {
++        if (ops->pipelines[i].format == format)
++        {
++            info->vk_pipeline = ops->pipelines[i].vk_pipeline;
++            hr = S_OK;
++            goto out;
++        }
++    }
++
++    if (!vkd3d_array_reserve((void **)&ops->pipelines, &ops->pipelines_size,
++            ops->pipeline_count + 1, sizeof(*ops->pipelines)))
++    {
++        hr = E_OUTOFMEMORY;
++        goto out;
++    }
++
++    memset(&blend_state, 0, sizeof(blend_state));
++    blend_state.blendEnable = VK_TRUE;
++    blend_state.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
++    blend_state.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
++    blend_state.colorBlendOp = VK_BLEND_OP_ADD;
++    blend_state.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
++    blend_state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
++    blend_state.alphaBlendOp = VK_BLEND_OP_ADD;
++    blend_state.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
++            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
++
++    pipeline = &ops->pipelines[ops->pipeline_count];
++    if ((vr = vkd3d_meta_create_graphics_pipeline(meta_ops, ops->vk_pipeline_layout,
++            format, VK_FORMAT_UNDEFINED, VK_IMAGE_ASPECT_COLOR_BIT,
++            ops->vk_vs_module, ops->vk_fs_module, VK_SAMPLE_COUNT_1_BIT,
++            NULL, 0, NULL, NULL, &blend_state, false, &pipeline->vk_pipeline)) < 0)
++    {
++        hr = hresult_from_vk_result(vr);
++        goto out;
++    }
++
++    pipeline->format = format;
++    ops->pipeline_count++;
++    info->vk_pipeline = pipeline->vk_pipeline;
++    hr = S_OK;
++
++out:
++    pthread_mutex_unlock(&ops->mutex);
++    return hr;
++}
++
+ static void vkd3d_query_ops_cleanup(struct vkd3d_query_ops *meta_query_ops,
+         struct d3d12_device *device)
+ {
+@@ -2149,7 +2320,7 @@ static HRESULT vkd3d_sampler_feedback_ops_init(struct vkd3d_sampler_feedback_res
+             if ((vr = vkd3d_meta_create_graphics_pipeline(&device->meta_ops,
+                     sampler_feedback_ops->vk_graphics_decode_layout,
+                     VK_FORMAT_R8_UINT, VK_FORMAT_UNDEFINED, VK_IMAGE_ASPECT_COLOR_BIT, VK_NULL_HANDLE, vk_module,
+-                    VK_SAMPLE_COUNT_1_BIT, NULL, 0, NULL, NULL, true,
++                    VK_SAMPLE_COUNT_1_BIT, NULL, 0, NULL, NULL, NULL, true,
+                     &sampler_feedback_ops->vk_pipelines[pipelines[i].type])))
+             {
+                 VK_CALL(vkDestroyShaderModule(device->vk_device, vk_module, NULL));
+@@ -2378,6 +2549,9 @@ HRESULT vkd3d_meta_ops_init(struct vkd3d_meta_ops *meta_ops, struct d3d12_device
+     if (FAILED(hr = vkd3d_swapchain_ops_init(&meta_ops->swapchain, device)))
+         goto fail_swapchain_ops;
+ 
++    if (FAILED(hr = vkd3d_swapchain_hud_ops_init(&meta_ops->swapchain_hud)))
++        goto fail_swapchain_hud_ops;
++
+     if (FAILED(hr = vkd3d_query_ops_init(&meta_ops->query, device)))
+         goto fail_query_ops;
+ 
+@@ -2420,6 +2594,8 @@ fail_execute_indirect_ops:
+ fail_predicate_ops:
+     vkd3d_query_ops_cleanup(&meta_ops->query, device);
+ fail_query_ops:
++    vkd3d_swapchain_hud_ops_cleanup(&meta_ops->swapchain_hud, device);
++fail_swapchain_hud_ops:
+     vkd3d_swapchain_ops_cleanup(&meta_ops->swapchain, device);
+ fail_swapchain_ops:
+     vkd3d_resolve_image_ops_cleanup(&meta_ops->resolve_image_legacy, device);
+@@ -2449,6 +2625,7 @@ HRESULT vkd3d_meta_ops_cleanup(struct vkd3d_meta_ops *meta_ops, struct d3d12_dev
+     vkd3d_execute_indirect_ops_cleanup(&meta_ops->execute_indirect, device);
+     vkd3d_predicate_ops_cleanup(&meta_ops->predicate, device);
+     vkd3d_query_ops_cleanup(&meta_ops->query, device);
++    vkd3d_swapchain_hud_ops_cleanup(&meta_ops->swapchain_hud, device);
+     vkd3d_swapchain_ops_cleanup(&meta_ops->swapchain, device);
+     vkd3d_copy_image_ops_cleanup(&meta_ops->copy_image_heap, device);
+     vkd3d_copy_image_ops_cleanup(&meta_ops->copy_image_legacy, device);
+diff --git a/libs/vkd3d/shaders/fs_swapchain_hud.frag b/libs/vkd3d/shaders/fs_swapchain_hud.frag
+new file mode 100644
+index 00000000..b6664f87
+--- /dev/null
++++ b/libs/vkd3d/shaders/fs_swapchain_hud.frag
+@@ -0,0 +1,97 @@
++// Copyright 2026 Erhan Bilgili
++
++#version 450
++
++layout(set = 0, binding = 1, std430)
++readonly buffer font_buffer_t
++{
++    uint font_data[];
++};
++
++layout(push_constant)
++uniform push_data_t
++{
++    uvec2 surface_size;
++    float opacity;
++    float scale;
++    uint output_mode;
++    uint font_width;
++    uint font_height;
++};
++
++layout(location = 0) in vec2 v_texcoord;
++layout(location = 1) in vec4 v_color;
++
++layout(location = 0) out vec4 frag_color;
++
++float load_font_texel(ivec2 coord)
++{
++    coord = clamp(coord, ivec2(0), ivec2(font_width, font_height) - 1);
++    uint index = uint(coord.y) * font_width + uint(coord.x);
++    uint word = font_data[index >> 2];
++    return float((word >> ((index & 3) * 8)) & 0xff) / 255.0f;
++}
++
++float sample_font(vec2 coord)
++{
++    vec2 texel = coord - 0.5f;
++    ivec2 base = ivec2(floor(texel));
++    vec2 weight = fract(texel);
++    float x0 = mix(load_font_texel(base), load_font_texel(base + ivec2(1, 0)), weight.x);
++    float x1 = mix(load_font_texel(base + ivec2(0, 1)), load_font_texel(base + ivec2(1, 1)), weight.x);
++    return mix(x0, x1, weight.y);
++}
++
++float sample_alpha(float bias)
++{
++    float value = sample_font(v_texcoord) + bias - 0.5f;
++    float dist = value * dot(vec2(5.0f), 1.0f / fwidth(v_texcoord));
++    return clamp(dist + 0.5f, 0.0f, 1.0f);
++}
++
++vec3 linear_to_srgb(vec3 value)
++{
++    vec3 lo = value * 12.92f;
++    vec3 hi = pow(value, vec3(5.0f / 12.0f)) * 1.055f - 0.055f;
++    return mix(hi, lo, lessThanEqual(value, vec3(0.0031308f)));
++}
++
++vec3 nits_to_pq(vec3 nits)
++{
++    const float c1 = 0.8359375f;
++    const float c2 = 18.8515625f;
++    const float c3 = 18.6875f;
++    const float m1 = 0.1593017578125f;
++    const float m2 = 78.84375f;
++    vec3 value = clamp(nits / 10000.0f, vec3(0.0f), vec3(1.0f));
++    vec3 value_m1 = pow(value, vec3(m1));
++    return pow((c1 + c2 * value_m1) / (1.0f + c3 * value_m1), vec3(m2));
++}
++
++vec3 rec709_to_rec2020(vec3 color)
++{
++    return vec3(
++        dot(color, vec3(0.6274039f, 0.3292830f, 0.0433131f)),
++        dot(color, vec3(0.0690973f, 0.9195404f, 0.0113623f)),
++        dot(color, vec3(0.0163914f, 0.0880133f, 0.8955953f)));
++}
++
++void main()
++{
++    float center_alpha = sample_alpha(0.0f);
++    float shadow_alpha = sample_alpha(0.3f);
++    vec4 color;
++
++    color.rgb = v_color.rgb * center_alpha;
++    color.a = shadow_alpha * v_color.a * opacity;
++    color.rgb *= color.a;
++
++    if (output_mode == 0)
++        color.rgb = linear_to_srgb(color.rgb);
++    else if (output_mode == 1)
++        color.rgb *= 203.0f / 80.0f;
++    else if (output_mode == 2)
++        color.rgb = nits_to_pq(rec709_to_rec2020(color.rgb) * 203.0f);
++
++    frag_color = color;
++}
+diff --git a/libs/vkd3d/shaders/vs_swapchain_hud.vert b/libs/vkd3d/shaders/vs_swapchain_hud.vert
+new file mode 100644
+index 00000000..69e1822b
+--- /dev/null
++++ b/libs/vkd3d/shaders/vs_swapchain_hud.vert
+@@ -0,0 +1,44 @@
++// Copyright 2026 Erhan Bilgili
++
++#version 450
++
++struct hud_vertex_t
++{
++    vec2 position;
++    vec2 texcoord;
++    uint color;
++    uint padding;
++};
++
++layout(set = 0, binding = 0, std430)
++readonly buffer vertex_buffer_t
++{
++    hud_vertex_t vertices[];
++};
++
++layout(push_constant)
++uniform push_data_t
++{
++    uvec2 surface_size;
++    float opacity;
++    float scale;
++    uint output_mode;
++    uint font_width;
++    uint font_height;
++};
++
++layout(location = 0) out vec2 v_texcoord;
++layout(location = 1) out vec4 v_color;
++
++void main()
++{
++    hud_vertex_t vertex = vertices[gl_VertexIndex];
++    vec2 position = vertex.position * scale;
++
++    gl_Position = vec4(
++        2.0f * position.x / float(surface_size.x) - 1.0f,
++        2.0f * position.y / float(surface_size.y) - 1.0f,
++        0.0f, 1.0f);
++    v_texcoord = vertex.texcoord;
++    v_color = unpackUnorm4x8(vertex.color);
++}
+diff --git a/libs/vkd3d/swapchain.c b/libs/vkd3d/swapchain.c
+index 180cf246..edf97477 100644
+--- a/libs/vkd3d/swapchain.c
++++ b/libs/vkd3d/swapchain.c
+@@ -1,4 +1,6 @@
+ /*
++ * Wineland HUD modifications by Erhan Bilgili on 2026-09-30.
++ *
+  * Copyright 2022 Hans-Kristian Arntzen for Valve Corporation
+  *
+  * This library is free software; you can redistribute it and/or
+@@ -22,6 +24,7 @@
+ #include "vkd3d_win32.h"
+ #endif
+ #include "vkd3d_private.h"
++#include "swapchain_hud.h"
+ #include "vkd3d_timestamp_profiler.h"
+ #include "framepacer/framepacer_bridge.h"
+ 
+@@ -113,6 +116,16 @@ struct anti_lag_state
+     uint32_t max_fps;
+ };
+ 
++struct dxgi_vk_swap_chain_hud_frame
++{
++    DXGI_VK_HUD_VERTEX *vertices;
++    size_t vertices_size;
++    uint32_t vertex_count;
++    VkExtent2D layout_extent;
++    float scale;
++    float opacity;
++};
++
+ struct dxgi_vk_swap_chain_present_request
+ {
+     uint64_t begin_frame_time_ns;
+@@ -130,6 +143,7 @@ struct dxgi_vk_swap_chain_present_request
+     };
+     bool low_latency_update_requested;
+     bool modifies_hdr_metadata;
++    struct dxgi_vk_swap_chain_hud_frame hud;
+ };
+ 
+ struct present_wait_entry
+@@ -160,7 +174,7 @@ struct platform_sleep_state
+ 
+ struct dxgi_vk_swap_chain
+ {
+-    IDXGIVkSwapChain2 IDXGIVkSwapChain_iface;
++    IDXGIVkSwapChainHud IDXGIVkSwapChain_iface;
+     struct d3d12_command_queue *queue;
+ 
+     LONG refcount;
+@@ -171,6 +185,7 @@ struct dxgi_vk_swap_chain
+     vkd3d_native_sync_handle frame_latency_event_internal;
+     bool outstanding_present_request;
+     uint32_t frame_latency_event_internal_wait_counts;
++    uint32_t last_present_mode; /* Atomically published for the HUD thread. */
+ 
+     UINT frame_latency;
+     UINT frame_latency_internal;
+@@ -311,8 +326,19 @@ struct dxgi_vk_swap_chain
+         DXGI_VK_HDR_METADATA dxgi_hdr_metadata;
+         bool modifies_hdr_metadata;
+         uint64_t begin_frame_time_ns;
++        struct dxgi_vk_swap_chain_hud_frame hud;
+     } user;
+ 
++    struct
++    {
++        struct vkd3d_swapchain_hud renderer;
++        uint8_t *font_data;
++        uint32_t font_data_size;
++        uint32_t font_width;
++        uint32_t font_height;
++        bool enabled;
++    } hud;
++
+     struct
+     {
+         spinlock_t lock;
+@@ -350,6 +376,7 @@ struct dxgi_vk_swap_chain
+         size_t wait_queue_size;
+         size_t wait_queue_count;
+         pthread_cond_t cond;
++        pthread_cond_t present_cond;
+         pthread_mutex_t lock;
+         bool skip_waits;
+ 
+@@ -525,6 +552,13 @@ static void dxgi_vk_swap_chain_push_present_id(struct dxgi_vk_swap_chain *chain,
+     entry->pacer_frame_id = pacer_frame_id;
+     entry->begin_frame_time_ns = begin_frame_time_ns;
+     entry->present_timing_enabled = present_timing_enabled;
++    if (present_count)
++    {
++        /* The callback has finished reading the request's HUD vertices. */
++        vkd3d_atomic_uint64_store_explicit(&chain->present.present_count,
++                present_count, vkd3d_memory_order_release);
++        pthread_cond_broadcast(&chain->wait_thread.present_cond);
++    }
+     pthread_cond_signal(&chain->wait_thread.cond);
+     pthread_mutex_unlock(&chain->wait_thread.lock);
+ }
+@@ -551,6 +585,7 @@ static void dxgi_vk_swap_chain_cleanup_waiter_thread(struct dxgi_vk_swap_chain *
+     pthread_join(chain->wait_thread.thread, NULL);
+     pthread_mutex_destroy(&chain->wait_thread.lock);
+     pthread_cond_destroy(&chain->wait_thread.cond);
++    pthread_cond_destroy(&chain->wait_thread.present_cond);
+     vkd3d_free(chain->wait_thread.wait_queue);
+ }
+ 
+@@ -575,6 +610,12 @@ static void dxgi_vk_swap_chain_cleanup_common(struct dxgi_vk_swap_chain *chain)
+     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+     unsigned int i;
+ 
++    vkd3d_swapchain_hud_cleanup(&chain->hud.renderer, chain->queue->device);
++    vkd3d_free(chain->user.hud.vertices);
++    for (i = 0; i < ARRAY_SIZE(chain->request_ring); i++)
++        vkd3d_free(chain->request_ring[i].hud.vertices);
++    vkd3d_free(chain->hud.font_data);
++
+     VK_CALL(vkDestroySemaphore(chain->queue->device->vk_device, chain->present.vk_internal_blit_semaphore, NULL));
+     VK_CALL(vkDestroySemaphore(chain->queue->device->vk_device, chain->present.vk_complete_semaphore, NULL));
+     VK_CALL(vkDestroyCommandPool(chain->queue->device->vk_device, chain->present.vk_blit_command_pool, NULL));
+@@ -611,12 +652,12 @@ static void dxgi_vk_swap_chain_cleanup(struct dxgi_vk_swap_chain *chain)
+     dxgi_vk_swap_chain_cleanup_surface(chain);
+ }
+ 
+-static inline struct dxgi_vk_swap_chain *impl_from_IDXGIVkSwapChain(IDXGIVkSwapChain2 *iface)
++static inline struct dxgi_vk_swap_chain *impl_from_IDXGIVkSwapChain(IDXGIVkSwapChainHud *iface)
+ {
+     return CONTAINING_RECORD(iface, struct dxgi_vk_swap_chain, IDXGIVkSwapChain_iface);
+ }
+ 
+-static ULONG STDMETHODCALLTYPE dxgi_vk_swap_chain_AddRef(IDXGIVkSwapChain2 *iface)
++static ULONG STDMETHODCALLTYPE dxgi_vk_swap_chain_AddRef(IDXGIVkSwapChainHud *iface)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+     UINT refcount = InterlockedIncrement(&chain->refcount);
+@@ -633,7 +674,7 @@ static ULONG STDMETHODCALLTYPE dxgi_vk_swap_chain_AddRef(IDXGIVkSwapChain2 *ifac
+     return refcount;
+ }
+ 
+-static ULONG STDMETHODCALLTYPE dxgi_vk_swap_chain_Release(IDXGIVkSwapChain2 *iface)
++static ULONG STDMETHODCALLTYPE dxgi_vk_swap_chain_Release(IDXGIVkSwapChainHud *iface)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+     struct d3d12_device *device = chain->queue->device;
+@@ -659,14 +700,15 @@ static ULONG STDMETHODCALLTYPE dxgi_vk_swap_chain_Release(IDXGIVkSwapChain2 *ifa
+     return refcount;
+ }
+ 
+-static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_QueryInterface(IDXGIVkSwapChain2 *iface, REFIID riid, void **object)
++static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_QueryInterface(IDXGIVkSwapChainHud *iface, REFIID riid, void **object)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+     TRACE("iface %p\n", iface);
+     if (IsEqualGUID(riid, &IID_IUnknown) ||
+             IsEqualGUID(riid, &IID_IDXGIVkSwapChain) ||
+             IsEqualGUID(riid, &IID_IDXGIVkSwapChain1) ||
+-            IsEqualGUID(riid, &IID_IDXGIVkSwapChain2))
++            IsEqualGUID(riid, &IID_IDXGIVkSwapChain2) ||
++            IsEqualGUID(riid, &IID_IDXGIVkSwapChainHud))
+     {
+         dxgi_vk_swap_chain_AddRef(&chain->IDXGIVkSwapChain_iface);
+         *object = iface;
+@@ -676,7 +718,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_QueryInterface(IDXGIVkSwapCh
+     return E_NOINTERFACE;
+ }
+ 
+-static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_GetDesc(IDXGIVkSwapChain2 *iface, DXGI_SWAP_CHAIN_DESC1 *pDesc)
++static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_GetDesc(IDXGIVkSwapChainHud *iface, DXGI_SWAP_CHAIN_DESC1 *pDesc)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+     TRACE("iface %p, pDesc %p\n", iface, pDesc);
+@@ -684,21 +726,21 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_GetDesc(IDXGIVkSwapChain2 *i
+     return S_OK;
+ }
+ 
+-static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_GetAdapter(IDXGIVkSwapChain2 *iface, REFIID riid, void **object)
++static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_GetAdapter(IDXGIVkSwapChainHud *iface, REFIID riid, void **object)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+     TRACE("iface %p\n", iface);
+     return IUnknown_QueryInterface(chain->queue->device->parent, riid, object);
+ }
+ 
+-static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_GetDevice(IDXGIVkSwapChain2 *iface, REFIID riid, void **object)
++static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_GetDevice(IDXGIVkSwapChainHud *iface, REFIID riid, void **object)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+     TRACE("iface %p\n", iface);
+     return ID3D12Device15_QueryInterface(&chain->queue->device->ID3D12Device_iface, riid, object);
+ }
+ 
+-static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_GetImage(IDXGIVkSwapChain2 *iface, UINT BufferId, REFIID riid, void **object)
++static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_GetImage(IDXGIVkSwapChainHud *iface, UINT BufferId, REFIID riid, void **object)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+     TRACE("iface %p, BufferId %u.\n", iface, BufferId);
+@@ -707,21 +749,21 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_GetImage(IDXGIVkSwapChain2 *
+     return ID3D12Resource2_QueryInterface(&chain->user.backbuffers[BufferId]->ID3D12Resource_iface, riid, object);
+ }
+ 
+-static UINT STDMETHODCALLTYPE dxgi_vk_swap_chain_GetImageIndex(IDXGIVkSwapChain2 *iface)
++static UINT STDMETHODCALLTYPE dxgi_vk_swap_chain_GetImageIndex(IDXGIVkSwapChainHud *iface)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+     TRACE("iface %p.\n", iface);
+     return chain->user.index;
+ }
+ 
+-static UINT STDMETHODCALLTYPE dxgi_vk_swap_chain_GetFrameLatency(IDXGIVkSwapChain2 *iface)
++static UINT STDMETHODCALLTYPE dxgi_vk_swap_chain_GetFrameLatency(IDXGIVkSwapChainHud *iface)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+     TRACE("iface %p.\n", iface);
+     return chain->frame_latency;
+ }
+ 
+-static HANDLE STDMETHODCALLTYPE dxgi_vk_swap_chain_GetFrameLatencyEvent(IDXGIVkSwapChain2 *iface)
++static HANDLE STDMETHODCALLTYPE dxgi_vk_swap_chain_GetFrameLatencyEvent(IDXGIVkSwapChainHud *iface)
+ {
+     struct dxgi_vk_swap_chain *swapchain = impl_from_IDXGIVkSwapChain(iface);
+     HANDLE duplicated_handle;
+@@ -855,7 +897,7 @@ err:
+     return hr;
+ }
+ 
+-static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_ChangeProperties(IDXGIVkSwapChain2 *iface, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
++static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_ChangeProperties(IDXGIVkSwapChainHud *iface, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
+         const UINT *pNodeMasks, IUnknown *const *ppPresentQueues)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+@@ -913,19 +955,19 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_ChangeProperties(IDXGIVkSwap
+     return S_OK;
+ }
+ 
+-static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetPresentRegion(IDXGIVkSwapChain2 *iface, const RECT *pRegion)
++static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetPresentRegion(IDXGIVkSwapChainHud *iface, const RECT *pRegion)
+ {
+     FIXME("iface %p, pRegion %p stub!\n", iface, pRegion);
+     return E_NOTIMPL;
+ }
+ 
+-static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetGammaControl(IDXGIVkSwapChain2 *iface, UINT NumControlPoints, const DXGI_RGB *pControlPoints)
++static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetGammaControl(IDXGIVkSwapChainHud *iface, UINT NumControlPoints, const DXGI_RGB *pControlPoints)
+ {
+     FIXME("iface %p, NumControlPoints %u, pControlPoints %p stub!\n", iface, NumControlPoints, pControlPoints);
+     return E_NOTIMPL;
+ }
+ 
+-static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetFrameLatency(IDXGIVkSwapChain2 *iface, UINT MaxLatency)
++static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetFrameLatency(IDXGIVkSwapChainHud *iface, UINT MaxLatency)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+     TRACE("iface %p, MaxLatency %u.\n", iface, MaxLatency);
+@@ -1054,6 +1096,17 @@ static bool dxgi_vk_swap_chain_present_is_occluded(struct dxgi_vk_swap_chain *ch
+ 
+ static void dxgi_vk_swap_chain_present_callback(void *chain);
+ 
++static void dxgi_vk_swap_chain_wait_for_present_count(struct dxgi_vk_swap_chain *chain, uint64_t count)
++{
++    if (vkd3d_atomic_uint64_load_explicit(&chain->present.present_count, vkd3d_memory_order_acquire) >= count)
++        return;
++
++    pthread_mutex_lock(&chain->wait_thread.lock);
++    while (vkd3d_atomic_uint64_load_explicit(&chain->present.present_count, vkd3d_memory_order_acquire) < count)
++        pthread_cond_wait(&chain->wait_thread.present_cond, &chain->wait_thread.lock);
++    pthread_mutex_unlock(&chain->wait_thread.lock);
++}
++
+ static void dxgi_vk_swap_chain_wait_internal_handle(struct dxgi_vk_swap_chain *chain, bool low_latency_enable)
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+@@ -1122,10 +1175,11 @@ static void dxgi_vk_swap_chain_wait_internal_handle(struct dxgi_vk_swap_chain *c
+     }
+ }
+ 
+-static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *iface, UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS *pPresentParameters)
++static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChainHud *iface, UINT SyncInterval, UINT PresentFlags, const DXGI_PRESENT_PARAMETERS *pPresentParameters)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+     struct dxgi_vk_swap_chain_present_request *request;
++    struct dxgi_vk_swap_chain_hud_frame hud;
+     struct vkd3d_queue_timeline_trace_cookie cookie;
+     bool low_latency_enable;
+ 
+@@ -1144,12 +1198,26 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain2 *i
+         return S_OK;
+     }
+ 
++    /* Retire the ring slot before recycling its HUD allocation, independently
++     * of frame pacing. Leave HUD-disabled pacing unchanged. */
++    if (chain->hud.enabled && chain->user.present_count >= ARRAY_SIZE(chain->request_ring))
++        dxgi_vk_swap_chain_wait_for_present_count(chain,
++                chain->user.present_count - ARRAY_SIZE(chain->request_ring) + 1);
++
+     assert(chain->user.index < chain->desc.BufferCount);
+ 
+     /* The present iteration on present thread has a similar counter and it will pick up the request from the ring. */
+     chain->user.present_count += 1;
+     request = &chain->request_ring[chain->user.present_count % ARRAY_SIZE(chain->request_ring)];
+ 
++    if (chain->hud.enabled)
++    {
++        hud = request->hud;
++        request->hud = chain->user.hud;
++        chain->user.hud = hud;
++        chain->user.hud.vertex_count = 0;
++    }
++
+     request->pacer_frame_id = pacer_notify_present(chain->queue->device->pacer_device, chain);
+     request->swap_interval = SyncInterval;
+     request->dxgi_format = chain->user.backbuffers[chain->user.index]->desc.Format;
+@@ -1271,7 +1339,7 @@ static bool dxgi_vk_swap_chain_supports_color_space(struct dxgi_vk_swap_chain *c
+     return ret;
+ }
+ 
+-static UINT STDMETHODCALLTYPE dxgi_vk_swap_chain_CheckColorSpaceSupport(IDXGIVkSwapChain2 *iface, DXGI_COLOR_SPACE_TYPE ColorSpace)
++static UINT STDMETHODCALLTYPE dxgi_vk_swap_chain_CheckColorSpaceSupport(IDXGIVkSwapChainHud *iface, DXGI_COLOR_SPACE_TYPE ColorSpace)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+     UINT support_flags = 0;
+@@ -1281,7 +1349,7 @@ static UINT STDMETHODCALLTYPE dxgi_vk_swap_chain_CheckColorSpaceSupport(IDXGIVkS
+     return support_flags;
+ }
+ 
+-static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetColorSpace(IDXGIVkSwapChain2 *iface, DXGI_COLOR_SPACE_TYPE ColorSpace)
++static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetColorSpace(IDXGIVkSwapChainHud *iface, DXGI_COLOR_SPACE_TYPE ColorSpace)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+     TRACE("iface %p, ColorSpace %u.\n", iface, ColorSpace);
+@@ -1294,7 +1362,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetColorSpace(IDXGIVkSwapCha
+     return S_OK;
+ }
+ 
+-static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetHDRMetaData(IDXGIVkSwapChain2 *iface, const DXGI_VK_HDR_METADATA *pMetaData)
++static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetHDRMetaData(IDXGIVkSwapChainHud *iface, const DXGI_VK_HDR_METADATA *pMetaData)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+     TRACE("iface %p, pMetadata %p.\n", iface, pMetaData);
+@@ -1303,7 +1371,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetHDRMetaData(IDXGIVkSwapCh
+     return S_OK;
+ }
+ 
+-static void STDMETHODCALLTYPE dxgi_vk_swap_chain_GetLastPresentCount(IDXGIVkSwapChain2 *iface, UINT64 *present_count)
++static void STDMETHODCALLTYPE dxgi_vk_swap_chain_GetLastPresentCount(IDXGIVkSwapChainHud *iface, UINT64 *present_count)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+ 
+@@ -1313,7 +1381,7 @@ static void STDMETHODCALLTYPE dxgi_vk_swap_chain_GetLastPresentCount(IDXGIVkSwap
+     *present_count = chain->user.present_count;
+ }
+ 
+-static void STDMETHODCALLTYPE dxgi_vk_swap_chain_GetFrameStatistics(IDXGIVkSwapChain2 *iface,
++static void STDMETHODCALLTYPE dxgi_vk_swap_chain_GetFrameStatistics(IDXGIVkSwapChainHud *iface,
+         DXGI_VK_FRAME_STATISTICS *frame_statistics)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+@@ -1328,7 +1396,7 @@ static void STDMETHODCALLTYPE dxgi_vk_swap_chain_GetFrameStatistics(IDXGIVkSwapC
+     spinlock_release(&chain->frame_statistics.lock);
+ }
+ 
+-static void STDMETHODCALLTYPE dxgi_vk_swap_chain_SetTargetFrameRate(IDXGIVkSwapChain2 *iface, double frame_rate)
++static void STDMETHODCALLTYPE dxgi_vk_swap_chain_SetTargetFrameRate(IDXGIVkSwapChainHud *iface, double frame_rate)
+ {
+     struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
+ 
+@@ -1378,7 +1446,79 @@ static void STDMETHODCALLTYPE dxgi_vk_swap_chain_SetTargetFrameRate(IDXGIVkSwapC
+     pthread_mutex_unlock(&chain->frame_rate_limit.lock);
+ }
+ 
+-static CONST_VTBL struct IDXGIVkSwapChain2Vtbl dxgi_vk_swap_chain_vtbl =
++static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_SetHudData(IDXGIVkSwapChainHud *iface,
++        const DXGI_VK_HUD_DATA *data)
++{
++    struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
++    uint64_t font_data_size;
++    uint8_t *font_data;
++
++    TRACE("iface %p, data %p.\n", iface, data);
++
++    if (!data)
++    {
++        chain->user.hud.vertex_count = 0;
++        return S_OK;
++    }
++
++    if (data->StructSize < sizeof(*data) ||
++            data->VertexCount > VKD3D_SWAPCHAIN_HUD_MAX_VERTICES ||
++            (data->VertexCount && (!data->pVertices || data->VertexCount % 3)) ||
++            !isfinite(data->Scale) || data->Scale <= 0.0f ||
++            !isfinite(data->Opacity) || data->Opacity < 0.0f || data->Opacity > 1.0f)
++        return E_INVALIDARG;
++
++    if (data->VertexCount)
++    {
++        font_data_size = (uint64_t)data->FontWidth * data->FontHeight;
++        if (!data->FontWidth || !data->FontHeight || !data->pFontData ||
++                font_data_size != data->FontDataSize || font_data_size > 16 * 1024 * 1024)
++            return E_INVALIDARG;
++
++        if (chain->hud.font_data)
++        {
++            if (chain->hud.font_data_size != data->FontDataSize ||
++                    chain->hud.font_width != data->FontWidth ||
++                    chain->hud.font_height != data->FontHeight)
++                return E_INVALIDARG;
++        }
++        else
++        {
++            if (!(font_data = vkd3d_malloc(data->FontDataSize)))
++                return E_OUTOFMEMORY;
++
++            memcpy(font_data, data->pFontData, data->FontDataSize);
++            chain->hud.font_data = font_data;
++            chain->hud.font_data_size = data->FontDataSize;
++            chain->hud.font_width = data->FontWidth;
++            chain->hud.font_height = data->FontHeight;
++        }
++    }
++
++    if (data->VertexCount && !vkd3d_array_reserve((void **)&chain->user.hud.vertices,
++            &chain->user.hud.vertices_size, data->VertexCount, sizeof(*data->pVertices)))
++        return E_OUTOFMEMORY;
++
++    if (data->VertexCount)
++        memcpy(chain->user.hud.vertices, data->pVertices,
++                data->VertexCount * sizeof(*data->pVertices));
++    chain->user.hud.vertex_count = data->VertexCount;
++    /* Keep the vertex coordinate space with the queued frame across resizes. */
++    chain->user.hud.layout_extent.width = chain->desc.Width;
++    chain->user.hud.layout_extent.height = chain->desc.Height;
++    chain->user.hud.scale = data->Scale;
++    chain->user.hud.opacity = data->Opacity;
++    chain->hud.enabled = true;
++    return S_OK;
++}
++
++static UINT STDMETHODCALLTYPE dxgi_vk_swap_chain_GetPresentMode(IDXGIVkSwapChainHud *iface)
++{
++    struct dxgi_vk_swap_chain *chain = impl_from_IDXGIVkSwapChain(iface);
++    return vkd3d_atomic_uint32_load_explicit(&chain->last_present_mode, vkd3d_memory_order_relaxed);
++}
++
++static CONST_VTBL struct IDXGIVkSwapChainHudVtbl dxgi_vk_swap_chain_vtbl =
+ {
+     /* IUnknown methods */
+     dxgi_vk_swap_chain_QueryInterface,
+@@ -1406,6 +1546,9 @@ static CONST_VTBL struct IDXGIVkSwapChain2Vtbl dxgi_vk_swap_chain_vtbl =
+     dxgi_vk_swap_chain_GetFrameStatistics,
+     /* IDXGIVkSwapChain2 methods */
+     dxgi_vk_swap_chain_SetTargetFrameRate,
++    /* IDXGIVkSwapChainHud methods */
++    dxgi_vk_swap_chain_SetHudData,
++    dxgi_vk_swap_chain_GetPresentMode,
+ };
+ 
+ static bool dxgi_vk_swap_chain_update_formats_locked(struct dxgi_vk_swap_chain *chain, bool force_requery)
+@@ -1714,6 +1857,8 @@ static void dxgi_vk_swap_chain_destroy_swapchain_in_present_task(struct dxgi_vk_
+ 
+     VK_CALL(vkDestroySwapchainKHR(chain->queue->device->vk_device, chain->present.vk_swapchain, NULL));
+     chain->present.vk_swapchain = VK_NULL_HANDLE;
++    vkd3d_atomic_uint32_store_explicit(&chain->last_present_mode,
++            VK_PRESENT_MODE_MAX_ENUM_KHR, vkd3d_memory_order_relaxed);
+     chain->present.backbuffer_width = 0;
+     chain->present.backbuffer_height = 0;
+     chain->present.backbuffer_format = VK_FORMAT_UNDEFINED;
+@@ -2422,6 +2567,7 @@ static void dxgi_vk_swap_chain_record_render_pass(struct dxgi_vk_swap_chain *cha
+     VkViewport viewport;
+     bool blank_present;
+     bool blit_command;
++    bool hud_requested;
+ 
+     /* If application intends to present before we have rendered to it,
+      * it is valid, but we need to ignore the blit, just clear backbuffer. */
+@@ -2469,6 +2615,8 @@ static void dxgi_vk_swap_chain_record_render_pass(struct dxgi_vk_swap_chain *cha
+     blit_command = !blank_present &&
+             viewport.width == (float)chain->present.backbuffer_width &&
+             viewport.height == (float)chain->present.backbuffer_height;
++    hud_requested = chain->hud.enabled && chain->request.hud.vertex_count && chain->hud.font_data &&
++            !chain->hud.renderer.failed;
+ 
+     memset(&dep_info, 0, sizeof(dep_info));
+     dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+@@ -2588,12 +2736,22 @@ static void dxgi_vk_swap_chain_record_render_pass(struct dxgi_vk_swap_chain *cha
+             VK_CALL(vkCmdDraw(vk_cmd, 3, 1, 0, 0));
+         }
+ 
++        if (hud_requested)
++            vkd3d_swapchain_hud_record(&chain->hud.renderer, chain->queue->device,
++                    vk_cmd, swapchain_index, chain->present.backbuffer_format,
++                    chain->present.backbuffer_width, chain->present.backbuffer_height,
++                    chain->request.hud.layout_extent,
++                    chain->request.dxgi_color_space_type, chain->request.hud.vertices,
++                    chain->request.hud.vertex_count, chain->request.hud.scale,
++                    chain->request.hud.opacity, chain->hud.font_data,
++                    chain->hud.font_data_size, chain->hud.font_width, chain->hud.font_height);
++
+         VK_CALL(vkCmdEndRendering(vk_cmd));
+     }
+ 
+     if (blit_command)
+     {
+-		image_barrier[0].srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
++        image_barrier[0].srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+         image_barrier[0].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+ 
+         image_barrier[1].srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+@@ -2602,6 +2760,31 @@ static void dxgi_vk_swap_chain_record_render_pass(struct dxgi_vk_swap_chain *cha
+         image_barrier[1].dstAccessMask = VK_ACCESS_2_NONE;
+         image_barrier[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+         image_barrier[1].newLayout = user_backbuffer->common_layout;
++
++        if (hud_requested)
++        {
++            image_barrier[0].dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
++            image_barrier[0].dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
++            image_barrier[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++            image_barrier[0].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++            VK_CALL(vkCmdPipelineBarrier2(vk_cmd, &dep_info));
++
++            attachment_info.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++            VK_CALL(vkCmdBeginRendering(vk_cmd, &rendering_info));
++            vkd3d_swapchain_hud_record(&chain->hud.renderer, chain->queue->device,
++                    vk_cmd, swapchain_index, chain->present.backbuffer_format,
++                    chain->present.backbuffer_width, chain->present.backbuffer_height,
++                    chain->request.hud.layout_extent,
++                    chain->request.dxgi_color_space_type, chain->request.hud.vertices,
++                    chain->request.hud.vertex_count, chain->request.hud.scale,
++                    chain->request.hud.opacity, chain->hud.font_data,
++                    chain->hud.font_data_size, chain->hud.font_width, chain->hud.font_height);
++            VK_CALL(vkCmdEndRendering(vk_cmd));
++
++            image_barrier[0].srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
++            image_barrier[0].srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
++            dep_info.imageMemoryBarrierCount = 1;
++        }
+     }
+     else
+     {
+@@ -3145,7 +3328,11 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
+         vr = vk_result;
+ 
+     if (vr >= 0)
++    {
++        vkd3d_atomic_uint32_store_explicit(&chain->last_present_mode,
++                chain->present.selected_present_mode, vkd3d_memory_order_relaxed);
+         chain->present.current_backbuffer_index = UINT32_MAX;
++    }
+ 
+     if (use_present_id && vr >= 0)
+         chain->present.present_id_valid = true;
+@@ -3253,10 +3440,6 @@ static void dxgi_vk_swap_chain_present_callback(void *chain_)
+     /* Signal latency fence. */
+     dxgi_vk_swap_chain_signal_waitable_handle(chain, next_present_count);
+ 
+-    /* Signal main thread that we are done with all CPU work.
+-     * No need to signal a condition variable, main thread can poll to deduce. */
+-    vkd3d_atomic_uint64_store_explicit(&chain->present.present_count, next_present_count, vkd3d_memory_order_release);
+-
+ #ifdef VKD3D_ENABLE_BREADCRUMBS
+     vkd3d_breadcrumb_tracer_update_barrier_hashes(&chain->queue->device->breadcrumb_tracer);
+ #endif
+@@ -3759,6 +3942,7 @@ static HRESULT dxgi_vk_swap_chain_init_waiter_thread(struct dxgi_vk_swap_chain *
+             DXGI_MAX_SWAP_CHAIN_BUFFERS, sizeof(*chain->wait_thread.wait_queue));
+     pthread_mutex_init(&chain->wait_thread.lock, NULL);
+     pthread_cond_init(&chain->wait_thread.cond, NULL);
++    pthread_cond_init(&chain->wait_thread.present_cond, NULL);
+ 
+     /* Have to throw a thread under the bus unfortunately.
+      * That thread will only wait on present IDs and release HANDLEs as necessary. */
+@@ -3766,6 +3950,7 @@ static HRESULT dxgi_vk_swap_chain_init_waiter_thread(struct dxgi_vk_swap_chain *
+     {
+         pthread_mutex_destroy(&chain->wait_thread.lock);
+         pthread_cond_destroy(&chain->wait_thread.cond);
++        pthread_cond_destroy(&chain->wait_thread.present_cond);
+         return E_OUTOFMEMORY;
+     }
+ 
+@@ -3925,6 +4110,7 @@ static HRESULT dxgi_vk_swap_chain_init(struct dxgi_vk_swap_chain *chain, IDXGIVk
+     HRESULT hr;
+ 
+     chain->IDXGIVkSwapChain_iface.lpVtbl = &dxgi_vk_swap_chain_vtbl;
++    chain->last_present_mode = VK_PRESENT_MODE_MAX_ENUM_KHR;
+     chain->refcount = 1;
+     chain->internal_refcount = 1;
+     chain->queue = queue;
+diff --git a/libs/vkd3d/swapchain_hud.c b/libs/vkd3d/swapchain_hud.c
+new file mode 100644
+index 00000000..edd02d0d
+--- /dev/null
++++ b/libs/vkd3d/swapchain_hud.c
+@@ -0,0 +1,216 @@
++/*
++ * Copyright 2026 Erhan Bilgili
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
++
++#include "swapchain_hud.h"
++
++STATIC_ASSERT(sizeof(DXGI_VK_HUD_VERTEX) == 24);
++
++static void vkd3d_swapchain_hud_buffer_cleanup(struct vkd3d_swapchain_hud_buffer *buffer,
++        struct d3d12_device *device)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++
++    if (buffer->mapped)
++        VK_CALL(vkUnmapMemory(device->vk_device, buffer->memory.vk_memory));
++    VK_CALL(vkDestroyBuffer(device->vk_device, buffer->vk_buffer, NULL));
++    if (buffer->memory.vk_memory)
++        vkd3d_free_device_memory(device, &buffer->memory);
++    memset(buffer, 0, sizeof(*buffer));
++}
++
++static HRESULT vkd3d_swapchain_hud_buffer_init(struct vkd3d_swapchain_hud_buffer *buffer,
++        struct d3d12_device *device, VkDeviceSize size, const char *tag)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    HRESULT hr;
++    VkResult vr;
++
++    if (FAILED(hr = vkd3d_create_buffer_explicit_usage(device,
++            VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT_KHR, size, tag, &buffer->vk_buffer)))
++        return hr;
++
++    if (FAILED(hr = vkd3d_allocate_internal_buffer_memory(device, buffer->vk_buffer,
++            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
++            0, &buffer->memory)))
++        goto fail;
++
++    if ((vr = VK_CALL(vkMapMemory(device->vk_device, buffer->memory.vk_memory,
++            0, VK_WHOLE_SIZE, 0, &buffer->mapped))) < 0)
++    {
++        hr = hresult_from_vk_result(vr);
++        goto fail;
++    }
++
++    buffer->size = size;
++    return S_OK;
++
++fail:
++    vkd3d_swapchain_hud_buffer_cleanup(buffer, device);
++    return hr;
++}
++
++static HRESULT vkd3d_swapchain_hud_ensure_font(struct vkd3d_swapchain_hud *hud,
++        struct d3d12_device *device, const uint8_t *data, uint32_t size,
++        uint32_t width, uint32_t height)
++{
++    VkDeviceSize buffer_size;
++    HRESULT hr;
++
++    if (hud->font_buffer.vk_buffer)
++        return hud->font_width == width && hud->font_height == height ? S_OK : E_INVALIDARG;
++
++    buffer_size = (size + 3u) & ~3u;
++    if (FAILED(hr = vkd3d_swapchain_hud_buffer_init(&hud->font_buffer,
++            device, buffer_size, "swapchain-hud-font")))
++        return hr;
++
++    memcpy(hud->font_buffer.mapped, data, size);
++    memset((uint8_t *)hud->font_buffer.mapped + size, 0, buffer_size - size);
++    hud->font_width = width;
++    hud->font_height = height;
++    return S_OK;
++}
++
++static HRESULT vkd3d_swapchain_hud_ensure_vertices(struct vkd3d_swapchain_hud *hud,
++        struct d3d12_device *device, uint32_t index)
++{
++    VkDeviceSize size = VKD3D_SWAPCHAIN_HUD_MAX_VERTICES * sizeof(DXGI_VK_HUD_VERTEX);
++
++    if (hud->vertex_buffers[index].vk_buffer)
++        return S_OK;
++
++    return vkd3d_swapchain_hud_buffer_init(&hud->vertex_buffers[index],
++            device, size, "swapchain-hud-vertices");
++}
++
++static uint32_t vkd3d_swapchain_hud_output_mode(VkFormat format,
++        DXGI_COLOR_SPACE_TYPE color_space)
++{
++    if (color_space == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709)
++        return 1;
++    if (color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
++        return 2;
++
++    switch (format)
++    {
++        case VK_FORMAT_R8G8B8A8_SRGB:
++        case VK_FORMAT_B8G8R8A8_SRGB:
++        case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
++            return 3;
++        default:
++            return 0;
++    }
++}
++
++void vkd3d_swapchain_hud_cleanup(struct vkd3d_swapchain_hud *hud,
++        struct d3d12_device *device)
++{
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(hud->vertex_buffers); i++)
++        vkd3d_swapchain_hud_buffer_cleanup(&hud->vertex_buffers[i], device);
++    vkd3d_swapchain_hud_buffer_cleanup(&hud->font_buffer, device);
++}
++
++bool vkd3d_swapchain_hud_record(struct vkd3d_swapchain_hud *hud,
++        struct d3d12_device *device, VkCommandBuffer vk_cmd, uint32_t swapchain_index,
++        VkFormat format, uint32_t width, uint32_t height, VkExtent2D layout_extent,
++        DXGI_COLOR_SPACE_TYPE color_space,
++        const DXGI_VK_HUD_VERTEX *vertices, uint32_t vertex_count, float scale, float opacity,
++        const uint8_t *font_data, uint32_t font_data_size, uint32_t font_width, uint32_t font_height)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    struct vkd3d_swapchain_hud_push_constants push_constants;
++    struct vkd3d_swapchain_hud_buffer *vertex_buffer;
++    struct vkd3d_swapchain_hud_info pipeline;
++    VkDescriptorBufferInfo buffer_info[2];
++    VkWriteDescriptorSet writes[2];
++    VkViewport viewport;
++    VkRect2D scissor;
++    HRESULT hr;
++
++    if (!vertex_count || hud->failed || !layout_extent.width || !layout_extent.height)
++        return false;
++
++    if (swapchain_index >= ARRAY_SIZE(hud->vertex_buffers) ||
++            vertex_count > VKD3D_SWAPCHAIN_HUD_MAX_VERTICES)
++        return false;
++
++    if (FAILED(hr = vkd3d_swapchain_hud_ensure_font(hud, device,
++            font_data, font_data_size, font_width, font_height)) ||
++            FAILED(hr = vkd3d_swapchain_hud_ensure_vertices(hud, device, swapchain_index)) ||
++            FAILED(hr = vkd3d_meta_get_swapchain_hud_pipeline(&device->meta_ops, format, &pipeline)))
++    {
++        WARN("Failed to prepare swapchain HUD, hr %#lx.\n", (unsigned long)hr);
++        hud->failed = true;
++        return false;
++    }
++
++    vertex_buffer = &hud->vertex_buffers[swapchain_index];
++    memcpy(vertex_buffer->mapped, vertices, vertex_count * sizeof(*vertices));
++
++    memset(buffer_info, 0, sizeof(buffer_info));
++    buffer_info[0].buffer = vertex_buffer->vk_buffer;
++    buffer_info[0].range = vertex_count * sizeof(*vertices);
++    buffer_info[1].buffer = hud->font_buffer.vk_buffer;
++    buffer_info[1].range = hud->font_buffer.size;
++
++    memset(writes, 0, sizeof(writes));
++    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++    writes[0].dstBinding = 0;
++    writes[0].descriptorCount = 1;
++    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++    writes[0].pBufferInfo = &buffer_info[0];
++    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++    writes[1].dstBinding = 1;
++    writes[1].descriptorCount = 1;
++    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++    writes[1].pBufferInfo = &buffer_info[1];
++
++    memset(&push_constants, 0, sizeof(push_constants));
++    /* DXGI lays out vertices in user-backbuffer pixels. Normalize in that
++     * space, then let the viewport map them to the actual presentation image. */
++    push_constants.surface_size[0] = layout_extent.width;
++    push_constants.surface_size[1] = layout_extent.height;
++    push_constants.opacity = opacity;
++    push_constants.scale = scale;
++    push_constants.output_mode = vkd3d_swapchain_hud_output_mode(format, color_space);
++    push_constants.font_width = font_width;
++    push_constants.font_height = font_height;
++
++    memset(&viewport, 0, sizeof(viewport));
++    viewport.width = width;
++    viewport.height = height;
++    viewport.maxDepth = 1.0f;
++    memset(&scissor, 0, sizeof(scissor));
++    scissor.extent.width = width;
++    scissor.extent.height = height;
++
++    VK_CALL(vkCmdSetViewport(vk_cmd, 0, 1, &viewport));
++    VK_CALL(vkCmdSetScissor(vk_cmd, 0, 1, &scissor));
++    VK_CALL(vkCmdBindPipeline(vk_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.vk_pipeline));
++    VK_CALL(vkCmdPushDescriptorSetKHR(vk_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
++            pipeline.vk_pipeline_layout, 0, ARRAY_SIZE(writes), writes));
++    VK_CALL(vkCmdPushConstants(vk_cmd, pipeline.vk_pipeline_layout,
++            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
++            0, sizeof(push_constants), &push_constants));
++    VK_CALL(vkCmdDraw(vk_cmd, vertex_count, 1, 0, 0));
++    return true;
++}
+diff --git a/libs/vkd3d/swapchain_hud.h b/libs/vkd3d/swapchain_hud.h
+new file mode 100644
+index 00000000..cc71089b
+--- /dev/null
++++ b/libs/vkd3d/swapchain_hud.h
+@@ -0,0 +1,53 @@
++/*
++ * Copyright 2026 Erhan Bilgili
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef VKD3D_SWAPCHAIN_HUD_H
++#define VKD3D_SWAPCHAIN_HUD_H
++
++#include "vkd3d_private.h"
++
++#define VKD3D_SWAPCHAIN_HUD_MAX_VERTICES 16384
++
++struct vkd3d_swapchain_hud_buffer
++{
++    VkBuffer vk_buffer;
++    struct vkd3d_device_memory_allocation memory;
++    void *mapped;
++    VkDeviceSize size;
++};
++
++struct vkd3d_swapchain_hud
++{
++    struct vkd3d_swapchain_hud_buffer vertex_buffers[DXGI_MAX_SWAP_CHAIN_BUFFERS];
++    struct vkd3d_swapchain_hud_buffer font_buffer;
++    uint32_t font_width;
++    uint32_t font_height;
++    bool failed;
++};
++
++void vkd3d_swapchain_hud_cleanup(struct vkd3d_swapchain_hud *hud,
++        struct d3d12_device *device);
++
++bool vkd3d_swapchain_hud_record(struct vkd3d_swapchain_hud *hud,
++        struct d3d12_device *device, VkCommandBuffer vk_cmd, uint32_t swapchain_index,
++        VkFormat format, uint32_t width, uint32_t height, VkExtent2D layout_extent,
++        DXGI_COLOR_SPACE_TYPE color_space,
++        const DXGI_VK_HUD_VERTEX *vertices, uint32_t vertex_count, float scale, float opacity,
++        const uint8_t *font_data, uint32_t font_data_size, uint32_t font_width, uint32_t font_height);
++
++#endif
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 7e8650a3..fd002fca 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -1,4 +1,6 @@
+ /*
++ * Wineland HUD modifications by Erhan Bilgili on 2026-09-30.
++ *
+  * Copyright 2016 Józef Kucia for CodeWeavers
+  *
+  * This library is free software; you can redistribute it and/or
+@@ -4853,6 +4855,45 @@ struct vkd3d_swapchain_ops
+     size_t pipeline_count;
+ };
+ 
++struct vkd3d_swapchain_hud_push_constants
++{
++    uint32_t surface_size[2];
++    float opacity;
++    float scale;
++    uint32_t output_mode;
++    uint32_t font_width;
++    uint32_t font_height;
++};
++
++struct vkd3d_swapchain_hud_info
++{
++    VkDescriptorSetLayout vk_set_layout;
++    VkPipelineLayout vk_pipeline_layout;
++    VkPipeline vk_pipeline;
++};
++
++struct vkd3d_swapchain_hud_pipeline
++{
++    VkFormat format;
++    VkPipeline vk_pipeline;
++};
++
++struct vkd3d_swapchain_hud_ops
++{
++    VkDescriptorSetLayout vk_set_layout;
++    VkPipelineLayout vk_pipeline_layout;
++    VkShaderModule vk_vs_module;
++    VkShaderModule vk_fs_module;
++
++    pthread_mutex_t mutex;
++    bool init_attempted;
++    HRESULT init_result;
++
++    struct vkd3d_swapchain_hud_pipeline *pipelines;
++    size_t pipelines_size;
++    size_t pipeline_count;
++};
++
+ #define VKD3D_QUERY_OP_WORKGROUP_SIZE (64)
+ 
+ struct vkd3d_query_resolve_args
+@@ -5139,6 +5180,7 @@ struct vkd3d_meta_ops
+     struct vkd3d_resolve_image_ops resolve_image_heap;
+     struct vkd3d_resolve_image_ops resolve_image_legacy;
+     struct vkd3d_swapchain_ops swapchain;
++    struct vkd3d_swapchain_hud_ops swapchain_hud;
+     struct vkd3d_query_ops query;
+     struct vkd3d_predicate_ops predicate;
+     struct vkd3d_execute_indirect_ops execute_indirect;
+@@ -5174,6 +5216,8 @@ HRESULT vkd3d_meta_get_resolve_image_pipeline(struct vkd3d_meta_ops *meta_ops,
+         const struct vkd3d_resolve_image_pipeline_key *key, struct vkd3d_resolve_image_info *info, bool heap);
+ HRESULT vkd3d_meta_get_swapchain_pipeline(struct vkd3d_meta_ops *meta_ops,
+         const struct vkd3d_swapchain_pipeline_key *key, struct vkd3d_swapchain_info *info);
++HRESULT vkd3d_meta_get_swapchain_hud_pipeline(struct vkd3d_meta_ops *meta_ops,
++        VkFormat format, struct vkd3d_swapchain_hud_info *info);
+ 
+ bool vkd3d_meta_get_query_gather_pipeline(struct vkd3d_meta_ops *meta_ops,
+         D3D12_QUERY_HEAP_TYPE heap_type, struct vkd3d_query_gather_info *info);
+diff --git a/libs/vkd3d/vkd3d_shaders.h b/libs/vkd3d/vkd3d_shaders.h
+index ded6b466..3cf083df 100644
+--- a/libs/vkd3d/vkd3d_shaders.h
++++ b/libs/vkd3d/vkd3d_shaders.h
+@@ -1,4 +1,6 @@
+ /*
++ * Wineland HUD modifications by Erhan Bilgili on 2026-09-30.
++ *
+  * Copyright 2019 Philip Rebohle
+  *
+  * This library is free software; you can redistribute it and/or
+@@ -59,6 +61,8 @@ enum vkd3d_meta_copy_mode
+ #include <fs_copy_image_stencil_no_export.h>
+ #include <vs_swapchain_fullscreen.h>
+ #include <fs_swapchain_fullscreen.h>
++#include <vs_swapchain_hud.h>
++#include <fs_swapchain_hud.h>
+ #include <cs_sampler_feedback_decode_buffer_min_mip.h>
+ #include <fs_sampler_feedback_decode_image_min_mip.h>
+ #include <fs_sampler_feedback_decode_image_mip_used.h>

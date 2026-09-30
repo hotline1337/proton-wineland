@@ -1,0 +1,72 @@
+From 55a14fcb8f6da10d36eb4889f16a45dc1a7e48cf Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Wed, 30 Sep 2026 12:19:09 +0200
+Subject: [PATCH 17/19] vkd3d: Move the pacer with out-of-band queues.
+
+Register the destination Vulkan queue with the pacer and update an already selected primary command queue. Retain the upstream requirement to migrate before submission.
+---
+ libs/vkd3d/command_queue_vkd3d_ext.c | 11 ++++++++++-
+ libs/vkd3d/framepacer/device.cpp     |  7 +++++++
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/libs/vkd3d/command_queue_vkd3d_ext.c b/libs/vkd3d/command_queue_vkd3d_ext.c
+index 5e12740c..b2469f09 100644
+--- a/libs/vkd3d/command_queue_vkd3d_ext.c
++++ b/libs/vkd3d/command_queue_vkd3d_ext.c
+@@ -1,5 +1,6 @@
+ /*
+  * * Copyright 2023 NVIDIA Corporation
++ * Wineland pacer migration changes by Erhan Bilgili on 2026-09-30.
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -55,6 +56,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_queue_vkd3d_ext_QueryInterface(d3
+ static HRESULT STDMETHODCALLTYPE d3d12_command_queue_vkd3d_ext_NotifyOutOfBandCommandQueue(d3d12_command_queue_vkd3d_ext_iface *iface, D3D12_OUT_OF_BAND_CQ_TYPE type)
+ {
+     struct d3d12_command_queue *command_queue;
++    struct pacer_vulkan_queue_info queue_info;
+     VkOutOfBandQueueTypeNV vk_queue_type;
+     int i;
+ 
+@@ -96,6 +98,14 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_queue_vkd3d_ext_NotifyOutOfBandCo
+ 
+             vkd3d_set_queue_out_of_band(command_queue->device, out_of_band_queue, vk_queue_type);
+             command_queue->vkd3d_queue = out_of_band_queue;
++
++            /* The pacer tracks physical queues too. Like the migration above,
++             * this must happen before the application submits work. */
++            queue_info.family_index = out_of_band_queue->vk_family_index;
++            queue_info.queue_flags = out_of_band_queue->vk_queue_flags;
++            queue_info.timestamp_valid_bits = command_queue->device->queue_families[i]->timestamp_bits;
++            command_queue->pacer_queues = pacer_register_queues(command_queue->device->pacer_device,
++                    command_queue, command_queue->desc.Type, out_of_band_queue, queue_info);
+             break;
+         }
+     }
+@@ -113,4 +123,3 @@ CONST_VTBL struct ID3D12CommandQueueExtVtbl d3d12_command_queue_vkd3d_ext_vtbl =
+     /* ID3D12CommandQueueExt methods */
+     d3d12_command_queue_vkd3d_ext_NotifyOutOfBandCommandQueue
+ };
+-
+diff --git a/libs/vkd3d/framepacer/device.cpp b/libs/vkd3d/framepacer/device.cpp
+index 79afdcd2..ab7db06a 100644
+--- a/libs/vkd3d/framepacer/device.cpp
++++ b/libs/vkd3d/framepacer/device.cpp
+@@ -1,3 +1,4 @@
++// Wineland pacer migration changes by Erhan Bilgili on 2026-09-30.
+ #include "device.h"
+ 
+ #include <algorithm>
+@@ -85,6 +86,12 @@ namespace pacer {
+                 queues.command_queue = (pacer_command_queue_handle) commandQueue;
+                 m_commandQueues.push_back( commandQueue );
+             }
++
++            // A swapchain may already have selected this command queue before
++            // NVAPI moves it to another Vulkan queue. Keep its pacer in sync.
++            CommandQueue* primary = m_primaryCommandQueue.load();
++            if (primary && primary->m_properties.vkd3d_command_queue == vkd3d_command_queue)
++                m_primaryCommandQueue.compare_exchange_strong(primary, (CommandQueue*) queues.command_queue);
+         }
+ 
+         INFO( "command_queue %u (%" PRIu64 ") registered to pacer [%" PRIu64

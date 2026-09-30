@@ -1,0 +1,68 @@
+From a88c1a8ac1df03cf1557bb9cca055ab73dcf597d Mon Sep 17 00:00:00 2001
+From: Hans-Kristian Arntzen <post@arntzen-software.no>
+Date: Mon, 3 Aug 2026 14:48:42 +0200
+Subject: [PATCH 15/19] vkd3d: Do not flush RTAS instantly with breadcrumbs.
+
+Signed-off-by: Hans-Kristian Arntzen <post@arntzen-software.no>
+---
+ libs/vkd3d/command.c | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index 9c29910e..11961f99 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -20457,6 +20457,8 @@ static void d3d12_command_list_flush_rtas_batch(struct d3d12_command_list *list)
+             rtas_batch->build_info_count, rtas_batch->build_infos, rtas_batch->range_ptrs));
+ 
+     d3d12_command_list_clear_rtas_batch(list);
++
++    VKD3D_BREADCRUMB_COMMAND(BUILD_RTAS);
+ }
+ 
+ static void d3d12_command_list_flush_rtas_barrier(struct d3d12_command_list *list)
+@@ -20657,8 +20659,6 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
+      * to create a deep copy of the entire D3D12 input description */
+     if (VKD3D_CONFIG_FLAG_IS_SET(BREADCRUMBS))
+     {
+-        d3d12_command_list_flush_rtas_batch(list);
+-
+         VKD3D_BREADCRUMB_TAG("RTAS build [Dest VA, Source VA, Scratch VA]");
+         VKD3D_BREADCRUMB_AUX64(desc->DestAccelerationStructureData);
+         VKD3D_BREADCRUMB_AUX64(desc->SourceAccelerationStructureData);
+@@ -20669,10 +20669,15 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
+         {
+             const struct vkd3d_vk_device_procs *vk_procs = &list->device->vk_procs;
+             VkAccelerationStructureBuildSizesInfoKHR size_info;
++            VkBuildAccelerationStructureFlagsKHR old_flags;
++            VkBuildAccelerationStructureModeKHR old_mode;
+ 
+             memset(&size_info, 0, sizeof(size_info));
+             size_info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+ 
++            old_flags = build_info->flags;
++            old_mode = build_info->mode;
++
+             if (desc->Inputs.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE)
+             {
+                 build_info->mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+@@ -20685,6 +20690,10 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
+             VK_CALL(vkGetAccelerationStructureBuildSizesKHR(list->device->vk_device,
+                     VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, build_info,
+                     primitive_counts, &size_info));
++
++            build_info->flags = old_flags;
++            build_info->mode = old_mode;
++
+             VKD3D_BREADCRUMB_TAG("Build requirements [Size, Build Scratch, Update Scratch]");
+             VKD3D_BREADCRUMB_AUX64(size_info.accelerationStructureSize);
+             VKD3D_BREADCRUMB_AUX64(size_info.buildScratchSize);
+@@ -20748,8 +20757,6 @@ static void d3d12_command_list_build_raytracing_blas_and_tlas(struct d3d12_comma
+                 desc->DestAccelerationStructureData,
+                 rtas_kind);
+     }
+-
+-    VKD3D_BREADCRUMB_COMMAND(BUILD_RTAS);
+ }
+ 
+ static void STDMETHODCALLTYPE d3d12_command_list_BuildRaytracingAccelerationStructure(d3d12_command_list_iface *iface,

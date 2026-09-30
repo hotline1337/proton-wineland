@@ -1,0 +1,85 @@
+From 8eab789d65cc027e7a89a01894ca08e0d8a85caa Mon Sep 17 00:00:00 2001
+From: Hans-Kristian Arntzen <post@arntzen-software.no>
+Date: Wed, 26 Aug 2026 13:16:12 +0200
+Subject: [PATCH 07/19] tests: Add smoke test for OOB queue transition
+
+Signed-off-by: Hans-Kristian Arntzen <post@arntzen-software.no>
+---
+ tests/d3d12.c                     |  1 +
+ tests/d3d12_dxvk_interop_device.c | 33 +++++++++++++++++++++++++++++++
+ tests/d3d12_tests.h               |  1 +
+ 3 files changed, 35 insertions(+)
+
+diff --git a/tests/d3d12.c b/tests/d3d12.c
+index 3f75da4d..5aef8d53 100644
+--- a/tests/d3d12.c
++++ b/tests/d3d12.c
+@@ -26,6 +26,7 @@
+ #include "d3d12_crosstest.h"
+ #include "vkd3d_device_vkd3d_ext.h"
+ #include "vkd3d_command_list_vkd3d_ext.h"
++#include "vkd3d_command_queue_vkd3d_ext.h"
+ 
+ #define decl_test(x) void x(void);
+ #include "d3d12_tests.h"
+diff --git a/tests/d3d12_dxvk_interop_device.c b/tests/d3d12_dxvk_interop_device.c
+index 3afb1496..e83ddb38 100644
+--- a/tests/d3d12_dxvk_interop_device.c
++++ b/tests/d3d12_dxvk_interop_device.c
+@@ -19,6 +19,7 @@
+ 
+ #define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_API
+ #include "d3d12_crosstest.h"
++#include "vkd3d_command_queue_vkd3d_ext.h"
+ 
+ void test_vkd3d_dxvk_cmdbuf_interop(void)
+ {
+@@ -163,3 +164,35 @@ void test_vkd3d_dxvk_cmdbuf_interop(void)
+     ID3D12DXVKInteropDevice1_Release(interop_device);
+     destroy_test_context(&context);
+ }
++
++void test_vkd3d_out_of_band_interop(void)
++{
++    /* Just verify that it doesn't explode. */
++    D3D12_COMMAND_QUEUE_DESC queue_desc;
++    ID3D12CommandQueueExt *queue_ext;
++    ID3D12CommandQueue *queues[2];
++    struct test_context context;
++    unsigned int i;
++
++    if (!init_compute_test_context(&context))
++        return;
++
++    memset(&queue_desc, 0, sizeof(queue_desc));
++    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
++    for (i = 0; i < ARRAY_SIZE(queues); i++)
++        ID3D12Device_CreateCommandQueue(context.device, &queue_desc, &IID_ID3D12CommandQueue, (void**)&queues[i]);
++
++    for (i = 0; i < ARRAY_SIZE(queues); i++)
++    {
++        if (SUCCEEDED(ID3D12CommandQueue_QueryInterface(queues[i], &IID_ID3D12CommandQueueExt, (void **)&queue_ext)))
++        {
++            ID3D12CommandQueueExt_NotifyOutOfBandCommandQueue(queue_ext, D3D12_OUT_OF_BAND_CQ_TYPE_PRESENT);
++            ID3D12CommandQueueExt_Release(queue_ext);
++        }
++    }
++
++    for (i = 0; i < ARRAY_SIZE(queues); i++)
++        ID3D12CommandQueue_Release(queues[i]);
++
++    destroy_test_context(&context);
++}
+\ No newline at end of file
+diff --git a/tests/d3d12_tests.h b/tests/d3d12_tests.h
+index e0dc31c8..910f71a0 100644
+--- a/tests/d3d12_tests.h
++++ b/tests/d3d12_tests.h
+@@ -476,6 +476,7 @@ decl_test(test_sm68_wave_size_range);
+ decl_test(test_sm68_sample_cmp_bias_grad);
+ decl_test(test_planar_video_formats);
+ decl_test(test_vkd3d_dxvk_cmdbuf_interop);
++decl_test(test_vkd3d_out_of_band_interop);
+ decl_test(test_large_texel_buffer_view);
+ decl_test(test_destruction_notifier_callback);
+ decl_test(test_destruction_notifier_interfaces);

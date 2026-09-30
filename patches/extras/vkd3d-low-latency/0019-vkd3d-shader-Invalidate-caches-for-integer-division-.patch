@@ -1,0 +1,31 @@
+From ad30effcc379dabe0e667fce4a489885385ba4d2 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Wed, 30 Sep 2026 12:20:58 +0200
+Subject: [PATCH 19/19] vkd3d-shader: Invalidate caches for integer division
+ fixes.
+
+The low-latency build applies compiler patches without changing its source revision. Bump the shader interface revision so old binaries are not reused.
+---
+ libs/vkd3d-shader/vkd3d_shader_main.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/libs/vkd3d-shader/vkd3d_shader_main.c b/libs/vkd3d-shader/vkd3d_shader_main.c
+index 39971d79..e871f634 100644
+--- a/libs/vkd3d-shader/vkd3d_shader_main.c
++++ b/libs/vkd3d-shader/vkd3d_shader_main.c
+@@ -1,4 +1,5 @@
+ /*
++ * Wineland shader-cache revision change by Erhan Bilgili on 2026-09-30.
+  * Copyright 2017 Józef Kucia for CodeWeavers
+  *
+  * This library is free software; you can redistribute it and/or
+@@ -542,7 +543,8 @@ uint64_t vkd3d_shader_get_revision(vkd3d_shader_quirks_t *aux_quirks)
+     if (aux_quirks)
+         *aux_quirks = quirks;
+ 
+-    return quirk_hash ^ 1;
++    /* Build-time compiler patches do not change the source Git revision. */
++    return quirk_hash ^ 2;
+ }
+ 
+ struct vkd3d_shader_stage_io_entry *vkd3d_shader_stage_io_map_append(struct vkd3d_shader_stage_io_map *map,
