@@ -1,0 +1,39 @@
+From 96da5b495eb9f2e7ad681c089fdc62aacec1eb74 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Wed, 30 Sep 2026 13:06:25 +0200
+Subject: [PATCH] vkd3d: Publish the low-latency renderer version.
+
+Expose the renderer name and build version through device private data
+for the DXGI HUD, without extending the swapchain interface.
+---
+ libs/vkd3d/device.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index d44436a2..e1f48044 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -11401,6 +11401,11 @@ static void d3d12_device_reserve_internal_sparse_queue(struct d3d12_device *devi
+ static HRESULT d3d12_device_init(struct d3d12_device *device,
+         struct vkd3d_instance *instance, const struct vkd3d_device_create_info *create_info)
+ {
++    /* Private ID3D12Object data shared with DXVK: a NUL-terminated UTF-8
++     * renderer name and build version, including the terminating byte. */
++    static const GUID renderer_version_guid =
++            {0x6af3f90b, 0x371c, 0x4260, {0x81, 0x32, 0x47, 0x79, 0x33, 0x99, 0x02, 0x77}};
++    char renderer_version[sizeof("VKD3D-LOW-LATENCY ") + sizeof(vkd3d_version) - 1];
+     const struct vkd3d_vk_device_procs *vk_procs;
+     struct pacer_device_properties pacer_device_properties;
+     struct pacer_device_vk_procs pacer_device_vk_procs;
+@@ -11464,6 +11469,11 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
+     if (FAILED(hr = vkd3d_private_store_init(&device->private_store)))
+         goto out_free_vk_resources;
+ 
++    snprintf(renderer_version, sizeof(renderer_version), "VKD3D-LOW-LATENCY %s", vkd3d_version);
++    if (FAILED(vkd3d_set_private_data(&device->private_store, &renderer_version_guid,
++            sizeof(renderer_version), renderer_version, NULL, NULL)))
++        WARN("Failed to publish renderer build identity.\n");
++
+     if (FAILED(hr = vkd3d_memory_transfer_queue_init(&device->memory_transfers, device)))
+         goto out_free_private_store;
+ 
