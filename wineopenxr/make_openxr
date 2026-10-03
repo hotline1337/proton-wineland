@@ -2529,13 +2529,13 @@ class Generator(object):
             f.write(f" \\\n    USE_XR_FUNC({func.name})")
         f.write("\n\n")
 
-        f.write("#endif /* __WINE_OPENXR_THUNKS_H */\n")
         f.write("/* For use by xrInstance and children */\n")
         f.write("struct openxr_instance_funcs\n{\n")
         f.write("#define USE_XR_FUNC(x) PFN_ ## x p_ ## x;\n")
         f.write("    ALL_XR_INSTANCE_FUNCS()\n")
         f.write("#undef USE_XR_FUNC\n")
         f.write("};\n\n")
+        f.write("#endif /* __WINE_OPENXR_THUNKS_H */\n")
 
 
     def generate_loader_thunks_c(self, f):

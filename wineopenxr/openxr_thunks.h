@@ -526,7 +526,6 @@ XrResult wine_xrGetVulkanInstanceExtensionsKHR(XrInstance instance, XrSystemId s
     USE_XR_FUNC(xrWaitFrame) \
     USE_XR_FUNC(xrWaitSwapchainImage)
 
-#endif /* __WINE_OPENXR_THUNKS_H */
 /* For use by xrInstance and children */
 struct openxr_instance_funcs
 {
@@ -535,3 +534,4 @@ struct openxr_instance_funcs
 #undef USE_XR_FUNC
 };
 
+#endif /* __WINE_OPENXR_THUNKS_H */
