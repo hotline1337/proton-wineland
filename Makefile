@@ -1,5 +1,20 @@
 #See help target below for documentation
 
+target_arch ?= x86_64
+WINE_UNIX_ARCHS := i386 x86_64
+WINE_PE_ARCHS := i386 x86_64
+PROTONSDK_ARCH := x86_64
+ifeq ($(target_arch),arm64)
+    WINE_UNIX_ARCHS := aarch64
+    WINE_PE_ARCHS += aarch64
+    PROTONSDK_ARCH := arm64-llvm
+    ARCH_SUFFIX := -arm64
+else ifneq ($(target_arch),x86_64)
+    $(error Unknown target_arch=$(target_arch))
+endif
+WINE_LIB_ARCHS := $(addsuffix -windows,$(WINE_PE_ARCHS)) $(addsuffix -unix,$(WINE_UNIX_ARCHS))
+wine-object-arch = $(if $(filter arm64,$(target_arch)),aarch64,$(1))
+
 ifeq ($(build_name),)
     _build_name := $(shell git symbolic-ref --short HEAD 2>/dev/null)-local
 else
@@ -16,7 +31,7 @@ override _build_name := $(shell echo $(_build_name) | tr -dc '[:alnum:] ._-')
 BUILD_ROOT := build
 
 # make doesn't handle spaces well... replace them with underscores in paths
-BUILD_DIR := $(BUILD_ROOT)/build-$(shell echo $(_build_name) | sed -e 's/ /_/g')
+BUILD_DIR := $(BUILD_ROOT)/build-$(shell echo $(_build_name) | sed -e 's/ /_/g')$(ARCH_SUFFIX)
 STEAM_DIR := $(HOME)/.steam/root
 
 ifeq ($(build_name),)
@@ -24,6 +39,7 @@ ifeq ($(build_name),)
 else
     DEPLOY_DIR := $(_build_name)
 endif
+DEPLOY_DIR := $(DEPLOY_DIR)$(ARCH_SUFFIX)
 
 ifneq ($(module),)
     ifneq ($(findstring .drv,$(module)),)
@@ -44,12 +60,12 @@ ifneq ($(unstripped),)
 endif
 
 CONFIGURE_CMD := ../../configure.sh \
-	--build-name="$(_build_name)"
+	--build-name="$(_build_name)" --target-arch=$(target_arch)
 
 ifneq ($(protonsdk_version),)
-CONFIGURE_CMD += --proton-sdk-image=registry.gitlab.steamos.cloud/proton/sniper/sdk:$(protonsdk_version)
+CONFIGURE_CMD += --proton-sdk-image=registry.gitlab.steamos.cloud/proton/steamrt4/sdk/$(PROTONSDK_ARCH):$(protonsdk_version)
 else
-protonsdk_version := $(shell grep '^STEAMRT_IMAGE ' Makefile.in|xargs echo|cut -d: -f2)
+protonsdk_version := $(lastword $(subst :, ,$(shell make --silent SRCDIR=. TARGET_ARCH=$(target_arch) --file Makefile.in get-steamrt-image)))
 endif
 
 enable_ccache := 1
@@ -76,6 +92,7 @@ help:
 	@echo "  clean - Delete the Proton build directory"
 	@echo ""
 	@echo "Configuration variables:"
+	@echo "  target_arch - x86_64 (default) or arm64. ARM builds use a separate build directory."
 	@echo "  build_name - The name of the build, will be displayed in Steam. Defaults to"
 	@echo "               current proton.git branch name if available. A new build dir"
 	@echo "               will be created for each build_name, so if you override this,"
@@ -113,7 +130,7 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 protonsdk:
-	$(MAKE) $(MFLAGS) $(MAKEOVERRIDES) -C docker $(UNSTRIPPED) PROTONSDK_VERSION=$(protonsdk_version) proton
+	$(MAKE) $(MFLAGS) $(MAKEOVERRIDES) -C docker $(UNSTRIPPED) PROTONSDK_VERSION=$(protonsdk_version) $(if $(filter arm64,$(target_arch)),BUILD_ARCH=aarch64 proton-llvm,proton)
 
 configure: | $(BUILD_DIR)
 	if [ ! -e $(BUILD_DIR)/Makefile ]; then \
@@ -147,22 +164,17 @@ deploy: configure
 	cp -Rf $(BUILD_DIR)/deploy/* $(BUILD_ROOT)/$(DEPLOY_DIR)-deploy && \
 	echo "Proton deployed to $(BUILD_ROOT)/$(DEPLOY_DIR)-deploy"
 
-module: | $(BUILD_ROOT)/$(module)/lib/wine/i386-windows
-module: | $(BUILD_ROOT)/$(module)/lib/wine/i386-unix
-module: | $(BUILD_ROOT)/$(module)/lib/wine/x86_64-windows
-module: | $(BUILD_ROOT)/$(module)/lib/wine/x86_64-unix
+module: | $(addprefix $(BUILD_ROOT)/$(module)/lib/wine/,$(WINE_LIB_ARCHS))
 module: configure
 	$(MAKE) $(MFLAGS) $(MAKEOVERRIDES) -C $(BUILD_DIR)/ $(UNSTRIPPED) module=$(module) module && \
-	cp -f $(BUILD_DIR)/obj-wine-i386/dlls/$(module)/i386-windows/$(MODULE_PEFILE) $(BUILD_ROOT)/$(module)/lib/wine/i386-windows/ && \
-	cp -f $(BUILD_DIR)/obj-wine-x86_64/dlls/$(module)/x86_64-windows/$(MODULE_PEFILE) $(BUILD_ROOT)/$(module)/lib/wine/x86_64-windows/ && \
-	if [ -e $(BUILD_DIR)/obj-wine-i386/dlls/$(module)/$(MODULE_PEFILE).so ]; then \
-		cp -f $(BUILD_DIR)/obj-wine-i386/dlls/$(module)/$(MODULE_PEFILE).so $(BUILD_ROOT)/$(module)/lib/wine/i386-unix/ && \
-		cp -f $(BUILD_DIR)/obj-wine-x86_64/dlls/$(module)/$(MODULE_PEFILE).so $(BUILD_ROOT)/$(module)/lib/wine/x86_64-unix/; \
-	fi
-	if [ -e $(BUILD_DIR)/obj-wine-i386/dlls/$(module)/$(MODULE_SOFILE) ]; then \
-		cp -f $(BUILD_DIR)/obj-wine-i386/dlls/$(module)/$(MODULE_SOFILE) $(BUILD_ROOT)/$(module)/lib/wine/i386-unix/ && \
-		cp -f $(BUILD_DIR)/obj-wine-x86_64/dlls/$(module)/$(MODULE_SOFILE) $(BUILD_ROOT)/$(module)/lib/wine/x86_64-unix/; \
-	fi
+	$(foreach arch,$(WINE_PE_ARCHS),cp -f $(BUILD_DIR)/obj-wine-$(call wine-object-arch,$(arch))/dlls/$(module)/$(arch)-windows/$(MODULE_PEFILE) $(BUILD_ROOT)/$(module)/lib/wine/$(arch)-windows/ &&) true
+	for arch in $(WINE_UNIX_ARCHS); do \
+		for file in $(MODULE_PEFILE).so $(MODULE_SOFILE); do \
+			if [ -e $(BUILD_DIR)/obj-wine-$$arch/dlls/$(module)/$$file ]; then \
+				cp -f $(BUILD_DIR)/obj-wine-$$arch/dlls/$(module)/$$file $(BUILD_ROOT)/$(module)/lib/wine/$$arch-unix/ || exit 1; \
+			fi; \
+		done; \
+	done
 
 any $(CONTAINERGOALS): configure
 	$(MAKE) $(MFLAGS) $(MAKEOVERRIDES) -C $(BUILD_DIR)/ $(UNSTRIPPED) $(CONTAINERGOALS)
@@ -179,31 +191,21 @@ vkd3d-proton: | $(BUILD_ROOT)/vkd3d-proton/lib/wine/vkd3d-proton
 vkd3d-proton: any
 	cp -rf $(BUILD_DIR)/dist/files/lib/wine/vkd3d-proton/* $(BUILD_ROOT)/vkd3d-proton/lib/wine/vkd3d-proton/
 
-lsteamclient: | $(BUILD_ROOT)/lsteamclient/lib/wine/i386-windows
-lsteamclient: | $(BUILD_ROOT)/lsteamclient/lib/wine/i386-unix
-lsteamclient: | $(BUILD_ROOT)/lsteamclient/lib/wine/x86_64-windows
-lsteamclient: | $(BUILD_ROOT)/lsteamclient/lib/wine/x86_64-unix
+define copy-wine-libs
+	for arch in $(or $(3),$(WINE_LIB_ARCHS)); do \
+		mkdir -p $(BUILD_ROOT)/$(1)/lib/wine/$$arch && \
+		cp -f $(BUILD_DIR)/dist/files/lib/wine/$$arch/$(2) $(BUILD_ROOT)/$(1)/lib/wine/$$arch/ || exit 1; \
+	done
+endef
+
 lsteamclient: any
-	cp -f $(BUILD_DIR)/dist/files/lib/wine/i386-windows/lsteamclient.dll $(BUILD_ROOT)/lsteamclient/lib/wine/i386-windows/ && \
-	cp -f $(BUILD_DIR)/dist/files/lib/wine/i386-unix/lsteamclient.dll.so $(BUILD_ROOT)/lsteamclient/lib/wine/i386-unix/ && \
-	cp -f $(BUILD_DIR)/dist/files/lib/wine/x86_64-windows/lsteamclient.dll $(BUILD_ROOT)/lsteamclient/lib/wine/x86_64-windows/ && \
-	cp -f $(BUILD_DIR)/dist/files/lib/wine/x86_64-unix/lsteamclient.dll.so $(BUILD_ROOT)/lsteamclient/lib/wine/x86_64-unix/
+	$(call copy-wine-libs,lsteamclient,lsteamclient.*)
 
-vrclient: | $(BUILD_ROOT)/vrclient/lib/wine/i386-windows
-vrclient: | $(BUILD_ROOT)/vrclient/lib/wine/i386-unix
-vrclient: | $(BUILD_ROOT)/vrclient/lib/wine/x86_64-windows
-vrclient: | $(BUILD_ROOT)/vrclient/lib/wine/x86_64-unix
 vrclient: any
-	cp -f $(BUILD_DIR)/dist/files/lib/wine/i386-windows/vrclient.dll $(BUILD_ROOT)/vrclient/lib/wine/i386-windows/ && \
-	cp -f $(BUILD_DIR)/dist/files/lib/wine/i386-unix/vrclient.dll.so $(BUILD_ROOT)/vrclient/lib/wine/i386-unix/ && \
-	cp -f $(BUILD_DIR)/dist/files/lib/wine/x86_64-windows/vrclient_x64.dll $(BUILD_ROOT)/vrclient/lib/wine/x86_64-windows/ && \
-	cp -f $(BUILD_DIR)/dist/files/lib/wine/x86_64-unix/vrclient_x64.dll.so $(BUILD_ROOT)/vrclient/lib/wine/x86_64-unix/
+	$(call copy-wine-libs,vrclient,vrclient*)
 
-wineopenxr: | $(BUILD_ROOT)/wineopenxr/lib/wine/x86_64-windows
-wineopenxr: | $(BUILD_ROOT)/wineopenxr/lib/wine/x86_64-unix
 wineopenxr: any
-	cp -f $(BUILD_DIR)/dist/files/lib/wine/x86_64-windows/wineopenxr.dll $(BUILD_ROOT)/wineopenxr/lib/wine/x86_64-windows/ && \
-	cp -f $(BUILD_DIR)/dist/files/lib/wine/x86_64-unix/wineopenxr.dll.so $(BUILD_ROOT)/wineopenxr/lib/wine/x86_64-unix/
+	$(call copy-wine-libs,wineopenxr,wineopenxr.*,$(if $(filter arm64,$(target_arch)),$(WINE_LIB_ARCHS),x86_64-windows x86_64-unix))
 
 battleye: | $(BUILD_ROOT)/battleye/v1/lib/wine/i386-windows
 battleye: | $(BUILD_ROOT)/battleye/v1/lib/wine/i386-unix

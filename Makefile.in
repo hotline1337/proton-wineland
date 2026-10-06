@@ -2107,7 +2107,7 @@ distclean: dist-distclean
 ## make module=$dllname module[32,64]
 ##
 
-.PHONY: module32 module64 module
+.PHONY: module32 module64 modulearm64 module
 
 module32: | all-source wine-i386-configure
 	+$(MAKE) -j$(J) $(filter -j%,$(MAKEFLAGS)) $(MFLAGS) $(MAKEOVERRIDES) -C $(WINE_i386_OBJ)/dlls/$(module)
@@ -2115,8 +2115,15 @@ module32: | all-source wine-i386-configure
 module64: | all-source wine-x86_64-configure
 	+$(MAKE) -j$(J) $(filter -j%,$(MAKEFLAGS)) $(MFLAGS) $(MAKEOVERRIDES) -C $(WINE_x86_64_OBJ)/dlls/$(module)
 
+modulearm64: | all-source wine-aarch64-configure
+	+$(MAKE) -j$(J) $(filter -j%,$(MAKEFLAGS)) $(MFLAGS) $(MAKEOVERRIDES) -C $(WINE_aarch64_OBJ)/dlls/$(module)
+
 module: | all-source wine-configure
+ifeq ($(TARGET_ARCH),arm64)
+module: modulearm64
+else
 module: module32 module64
+endif
 
 ###############################
 else # outside of the container
