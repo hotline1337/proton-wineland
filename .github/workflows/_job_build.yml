@@ -6,6 +6,10 @@ on:
       name:
         required: true
         type: string
+      ref:
+        required: false
+        type: string
+        default: ''
       cflags:
         required: false
         type: string
@@ -72,6 +76,7 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v6
       with:
+        ref: ${{ inputs.ref }}
         fetch-depth: 0
         fetch-tags: true
         submodules: false
@@ -132,4 +137,3 @@ jobs:
       with:
         name: ${{ inputs.name }}.sha512sum
         path: ./build/${{ inputs.name }}.sha512sum
-

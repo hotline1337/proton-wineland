@@ -1,0 +1,87 @@
+name: ARM64 draft
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing release tag to build for ARM64 validation
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: arm64-draft-${{ inputs.version }}
+  cancel-in-progress: true
+
+jobs:
+  version:
+    runs-on: ubuntu-slim
+    outputs:
+      commit: ${{ steps.version.outputs.commit }}
+      name: ${{ steps.version.outputs.name }}
+      draft_version: ${{ steps.version.outputs.draft_version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - id: version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          case "$VERSION" in
+            ''|*[!A-Za-z0-9._-]*) echo 'Invalid release tag' >&2; exit 1 ;;
+          esac
+          commit=$(git rev-parse --verify "refs/tags/$VERSION^{commit}")
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "name=proton-$VERSION-arm64" >> "$GITHUB_OUTPUT"
+          echo "draft_version=$VERSION-arm64-draft" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    uses: ./.github/workflows/_job_build.yml
+    with:
+      name: ${{ needs.version.outputs.name }}
+      ref: ${{ needs.version.outputs.commit }}
+      runner: ubuntu-24.04-arm
+      cflags: -O2 -march=armv8.2-a -mtune=cortex-x3
+      rustflags: -Copt-level=3 -Ctarget-cpu=armv8.2-a
+      configure: >-
+        --target-arch=arm64
+        --enable-ccache
+        --without-tts
+        --without-extras=all
+        --without-vklayers=all
+        --without-nvidia-libs
+      continue: false
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-slim
+    steps:
+      - name: Create ARM64 draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.draft_version }}
+          COMMIT: ${{ needs.version.outputs.commit }}
+        run: |
+          if draft=$(gh release view "$VERSION" --json isDraft --jq .isDraft); then
+            if [ "$draft" != true ]; then
+              echo 'Refusing to upload experimental ARM64 artifacts to a published release' >&2
+              exit 1
+            fi
+          else
+            gh release create "$VERSION" --draft --prerelease --target "$COMMIT" \
+              --title "$VERSION" \
+              --notes 'Experimental ARM64 build for validation. TTS, extras, Vulkan layers and NVIDIA libraries are disabled.'
+          fi
+
+  upload:
+    needs: [version, release]
+    uses: ./.github/workflows/_job_upload.yml
+    with:
+      version: ${{ needs.version.outputs.draft_version }}
+      name: ${{ needs.version.outputs.name }}
