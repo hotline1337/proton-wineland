@@ -125,7 +125,11 @@ function configure() {
   if [[ -n $arg_target_arch ]]; then
     target_arch="$arg_target_arch"
   fi
-  info "Build targetting: $target_arch"
+  case "$target_arch" in
+    x86_64|arm64) ;;
+    *) die "Unknown target architecture: $target_arch" ;;
+  esac
+  info "Build targeting: $target_arch"
 
   # nothing specified, getting the default value from the Makefile to test the
   # container engine
@@ -206,8 +210,15 @@ function configure() {
       echo "WITHOUT_STEAMRT_DEPENDS := 1"
     fi
 
-    echo "HOST_CFLAGS := ${CFLAGS:--O2 -march=nocona -mtune=core-avx2}"
-    echo "HOST_RUSTFLAGS := ${RUSTFLAGS:--Copt-level=3 -Ctarget-cpu=nocona}"
+    if [[ $target_arch = arm64 ]]; then
+      echo "aarch64_CFLAGS := ${CFLAGS:--O2 -march=armv8.2-a -mtune=cortex-x3}"
+      echo 'arm64ec_CFLAGS := $(aarch64_CFLAGS)'
+      echo "aarch64_RUSTFLAGS := ${RUSTFLAGS:--Copt-level=3 -Ctarget-cpu=armv8.2-a}"
+      echo 'arm64ec_RUSTFLAGS := $(aarch64_RUSTFLAGS)'
+    else
+      echo "HOST_CFLAGS := ${CFLAGS:--O2 -march=nocona -mtune=core-avx2}"
+      echo "HOST_RUSTFLAGS := ${RUSTFLAGS:--Copt-level=3 -Ctarget-cpu=nocona}"
+    fi
 
     # Include base
     echo ""
