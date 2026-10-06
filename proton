@@ -1789,8 +1789,6 @@ class Session:
             self.env["SteamVirtualGamepadInfo"] = self.env["SteamVirtualGamepadInfo_Proton"]
 
         self.env.pop("WINEARCH", "")
-        if os.environ.get("PROTON_USE_WOW64", None) == "1" and platform.machine() == "x86_64":
-            self.env["WINEARCH"] = "wow64"
 
         if 'ORIG_'+ld_path_var not in os.environ:
             # Allow wine to restore this when calling an external app.
@@ -1992,6 +1990,10 @@ class Session:
         if "wined3d11" in self.compat_config:
             self.compat_config.add("wined3d")
 
+        if self.env.get("SteamGameId") == "4005300": # Dating 4 Girls
+            self.env.setdefault("PROTON_USE_WOW64", "1")
+        if self.env.get("PROTON_USE_WOW64") == "1" and platform.machine() == "x86_64":
+            self.env.setdefault("WINEARCH", "wow64")
         self.check_environment("PROTON_USE_WOW64", "wow64")
         if not self.check_environment("PROTON_USE_WINED3D", "wined3d"):
             self.check_environment("PROTON_USE_WINED3D11", "wined3d")
