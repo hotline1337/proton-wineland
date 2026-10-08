@@ -1010,23 +1010,38 @@ static unsigned char hexdigit( WCHAR c )
 
 static void url_unescape( WCHAR *s )
 {
-    unsigned int i, len;
-    unsigned char c, d1, d2;
+    unsigned int i, len, count, written;
+    unsigned char d1, d2;
+    WCHAR *dst = s;
+    char *tmp;
 
     len = wcslen( s );
     if (len < 3) return;
-    for (i = 0; i < len - 3; ++i)
+    if (!(tmp = (char *)malloc( len ))) return;
+    for (i = 0; i < len;)
     {
-        if (s[i] != '%') continue;
-        if ((d1 = hexdigit( s[i + 1] )) == 0xff || (d2 = hexdigit( s[i + 2] )) == 0xff)
+        count = 0;
+        while (i + 2 < len && s[i] == '%'
+                && (d1 = hexdigit( s[i + 1] )) != 0xff
+                && (d2 = hexdigit( s[i + 2] )) != 0xff && (d1 || d2))
         {
-            ERR( "Invalid escape %s.\n", debugstr_wn( s, 3 ) );
-            continue;
+            tmp[count++] = d1 * 0x10 + d2;
+            i += 3;
         }
-        s[i] = d1 * 0x10 + d2;
-        len -= 2;
-        memmove( &s[i + 1], &s[i + 3], (len - i) * sizeof(*s) );
+        if (count)
+        {
+            /* Decode escaped UTF-8 without narrowing literal UTF-16 characters. */
+            RtlUTF8ToUnicodeN( dst, count * sizeof(*dst), &written, tmp, count );
+            dst += written / sizeof(*dst);
+        }
+        else
+        {
+            /* Keep malformed escapes and encoded NULs rather than truncating the path. */
+            *dst++ = s[i++];
+        }
     }
+    *dst = 0;
+    free( tmp );
 }
 
 char *steamclient_dos_to_unix_path( const char *src, int is_url )

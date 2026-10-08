@@ -84,6 +84,130 @@ int main()
 }
 """)
 
+    def test_url_unescape(self):
+        source = SOURCE.read_text()
+        helper = source[source.index("static unsigned char hexdigit("):
+                        source.index("char *steamclient_dos_to_unix_path(")]
+        self.run_native(helper, r"""
+#include <cassert>
+#include <cerrno>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <iconv.h>
+#include <string>
+#include <vector>
+
+typedef char16_t WCHAR;
+static unsigned int conversions;
+static bool allocation_failure;
+
+static size_t wide_length(const WCHAR *s)
+{
+    const WCHAR *end = s;
+    while (*end) ++end;
+    return end - s;
+}
+
+static void *test_malloc(size_t count)
+{
+    return allocation_failure ? nullptr : malloc(count);
+}
+
+/* Supply the ntdll conversion contract while exercising the actual path helper. */
+static uint32_t RtlUTF8ToUnicodeN(WCHAR *dst, unsigned int size,
+                                unsigned int *written, const char *src, unsigned int count)
+{
+    ++conversions;
+    assert(size == count * sizeof(*dst));
+    iconv_t converter = iconv_open("UTF-16LE", "UTF-8");
+    assert(converter != (iconv_t)-1);
+    char *input = const_cast<char *>(src), *output = reinterpret_cast<char *>(dst);
+    size_t remaining = count, space = size;
+    uint32_t status = 0;
+    while (remaining)
+    {
+        if (iconv(converter, &input, &remaining, &output, &space) != (size_t)-1) continue;
+        assert(errno == EILSEQ || errno == EINVAL);
+        assert(space >= 2);
+        *output++ = '\xfd';
+        *output++ = '\xff';
+        space -= 2;
+        ++input;
+        --remaining;
+        status = 0x00000107;
+    }
+    *written = size - space;
+    iconv_close(converter);
+    return status;
+}
+
+#define wcslen wide_length
+#define malloc test_malloc
+ACTUAL_HELPER
+#undef malloc
+#undef wcslen
+
+static void check(const std::u16string &input, const std::u16string &expected)
+{
+    std::vector<WCHAR> buffer(input.begin(), input.end());
+    buffer.push_back(0);
+    buffer.push_back(0xabcd);
+    buffer.push_back(0x1234);
+    url_unescape(buffer.data());
+    assert(std::u16string(buffer.data()) == expected);
+    assert(wide_length(buffer.data()) <= input.size());
+    assert(buffer[input.size() + 1] == 0xabcd);
+    assert(buffer[input.size() + 2] == 0x1234);
+}
+
+int main()
+{
+    check(u"", u"");
+    check(u"%", u"%");
+    check(u"%2", u"%2");
+    check(u"%41", u"A");
+    check(u"file%20", u"file ");
+    check(u"%c3%a9", u"\u00e9");
+    check(u"%E4%B8%AD", u"\u4e2d");
+    check(u"%F0%9F%8E%AE", u"\U0001f3ae");
+    check(u"\u00e9/%E4%B8%AD/\U0001f3ae%20name", u"\u00e9/\u4e2d/\U0001f3ae name");
+    check(u"%GG%41%2", u"%GGA%2");
+    check(u"%41%00%42", u"A%00B");
+    check(u"%2520", u"%20");
+    check(u"%FF%41", u"\ufffdA");
+    check(u"%C3", u"\ufffd");
+    check(u"%C3x%A9", u"\ufffdx\ufffd");
+    check(std::u16string(1, 0xd800) + u"%41", std::u16string(1, 0xd800) + u"A");
+    check(std::u16string(4090, u'x') + u"%41", std::u16string(4090, u'x') + u"A");
+    check(std::u16string(4093, u'x'), std::u16string(4093, u'x'));
+
+    allocation_failure = true;
+    conversions = 0;
+    check(u"\u00e9/%E4%B8%AD", u"\u00e9/%E4%B8%AD");
+    assert(!conversions);
+    allocation_failure = false;
+
+    const std::u16string inputs[] = {u"%41", u"%c3%a9", u"%E4%B8%AD", u"%F0%9F%8E%AE",
+                                    u"%GG", u"%00", u"%FF", u"_", u"\u00e9", u"\U0001f3ae"};
+    const std::u16string outputs[] = {u"A", u"\u00e9", u"\u4e2d", u"\U0001f3ae", u"%GG",
+                                     u"%00", u"\ufffd", u"_", u"\u00e9", u"\U0001f3ae"};
+    uint32_t state = 1;
+    for (unsigned int iteration = 0; iteration < 5000; ++iteration)
+    {
+        std::u16string input, expected;
+        for (unsigned int j = 0; j < iteration % 31; ++j)
+        {
+            state = state * 1664525 + 1013904223;
+            unsigned int choice = state % 10;
+            input += inputs[choice];
+            expected += outputs[choice];
+        }
+        check(input, expected);
+    }
+}
+""")
+
 
 if __name__ == "__main__":
     unittest.main()
