@@ -2313,6 +2313,18 @@ class Session:
             if nonzero(self.env.get("PROTON_WAYLAND_STEAM_OVERLAY", "0")):
                 self.setup_wayland_steam_overlay()
             else:
+                if self.env.get("PROTON_WAYLAND_STEAM_OVERLAY") == "0":
+                    # Explicit opt-out disables Steam itself, not just our bridge.
+                    self.env["DISABLE_VK_LAYER_VALVE_steam_overlay_1"] = "1"
+                    preloads = self.env.get("LD_PRELOAD", "").replace(":", " ").split()
+                    remaining = [path for path in preloads
+                                 if os.path.basename(path) != "gameoverlayrenderer.so"]
+                    if remaining != preloads:
+                        if remaining:
+                            self.env["LD_PRELOAD"] = ":".join(remaining)
+                        else:
+                            self.env.pop("LD_PRELOAD", None)
+                    log("Steam overlay disabled for this launch")
                 self.env["PROTON_WAYLAND_STEAM_OVERLAY"] = "0"
             # This is required for OpenGL to work on winewayland
             self.env["WINE_USE_EGL"] = "1"

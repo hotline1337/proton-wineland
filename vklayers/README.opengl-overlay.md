@@ -7,8 +7,9 @@ OpenGL adapter preload. The launcher does not detect the game's graphics API.
 
 The common `PROTON_WAYLAND_STEAM_OVERLAY` setting remains the master switch.
 It is enabled by default for Steam games on WineWayland when the native Steam
-overlay is available; setting it to `0` disables both bridges, even with the
-OpenGL opt-in set. Vulkan overlay behavior is otherwise unchanged.
+overlay is available. Explicitly setting it to `0` disables Steam's native
+overlay and both bridges for that launch, even with the OpenGL opt-in set.
+Steam's saved preferences and other overlays are unchanged.
 
 For a WineWayland OpenGL game, remove any forced Zink override and add:
 
