@@ -49,8 +49,11 @@ DEFINE_VTBL_WRAPPER(56);
 static char temp_path_buffer[TEMP_PATH_BUFFER_LENGTH];
 
 static CRITICAL_SECTION steamclient_cs = { NULL, -1, 0, 0, 0, 0 };
+static CRITICAL_SECTION steamclient_init_cs = { NULL, -1, 0, 0, 0, 0 };
 static HANDLE steam_overlay_event;
 static BOOL wsa_initialized;
+static LONG steamclient_initialized;
+static BOOL steamclient_initializing;
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
 {
@@ -356,11 +359,22 @@ static BOOL get_env_win(const WCHAR *name, char *value, unsigned int size)
     return TRUE;
 }
 
-static int load_steamclient(void)
+static int init_steamclient(BOOL sync_environment)
 {
     char steam_app_id[4096], ignore_child_processes[4096];
     struct steamclient_init_params params = {.g_tmppath = temp_path_buffer};
     DWORD saved_err = GetLastError();
+    int ret = 0;
+
+    EnterCriticalSection(&steamclient_init_cs);
+    if (!sync_environment && ReadAcquire(&steamclient_initialized))
+    {
+        ret = 1;
+        goto unlock;
+    }
+    /* Native initialization may reenter us. Do not expose partial exports. */
+    if (steamclient_initializing) goto unlock;
+    steamclient_initializing = TRUE;
 
     if (!get_env_win(u"SteamAppId", steam_app_id, sizeof(steam_app_id)))
         params.steam_app_id_unset = TRUE;
@@ -372,7 +386,8 @@ static int load_steamclient(void)
     else
         params.ignore_child_processes = ignore_child_processes;
 
-    if (STEAMCLIENT_CALL( steamclient_init, &params )) return 0;
+    /* Unlike calls through resolved exports, initialization can fail and retry. */
+    if (steamclient_call(unix_steamclient_init, &params, "steamclient_init")) goto done;
     if (!wsa_initialized)
     {
         /* Some games depend on winsocks being initialized after initializing Steam API. */
@@ -381,8 +396,23 @@ static int load_steamclient(void)
         WSAStartup(0x202, &data);
         wsa_initialized = TRUE;
     }
-    SetLastError(saved_err);
-    return 1;
+    WriteRelease(&steamclient_initialized, TRUE);
+    ret = 1;
+
+done:
+    steamclient_initializing = FALSE;
+unlock:
+    LeaveCriticalSection(&steamclient_init_cs);
+    if (ret) SetLastError(saved_err);
+    return ret;
+}
+
+static int load_steamclient(BOOL sync_environment)
+{
+    /* Keep the ready path separate from the large environment buffers.
+     * CreateInterface must still see environment changes made by the caller. */
+    if (!sync_environment && ReadAcquire(&steamclient_initialized)) return 1;
+    return init_steamclient(sync_environment);
 }
 
 void *CDECL CreateInterface(const char *name, int *return_code)
@@ -390,7 +420,7 @@ void *CDECL CreateInterface(const char *name, int *return_code)
     struct steamclient_CreateInterface_params params = {.name = name, .return_code = return_code};
 
     TRACE("name: %s, return_code: %p\n", name, return_code);
-    if (!load_steamclient()) return NULL;
+    if (!load_steamclient(TRUE)) return NULL;
     if (STEAMCLIENT_CALL( steamclient_CreateInterface, &params )) return NULL;
     return create_win_interface( name, params._ret );
 }
@@ -484,7 +514,7 @@ int8_t CDECL Steam_FreeLastCallback( int32_t pipe )
     struct steamclient_Steam_FreeLastCallback_params params = {.pipe = pipe};
     TRACE( "%u\n", pipe );
 
-    if (!load_steamclient()) return 0;
+    if (!load_steamclient(FALSE)) return 0;
 
     HeapFree( GetProcessHeap(), 0, last_callback_data );
     last_callback_data = NULL;
@@ -508,7 +538,7 @@ int8_t CDECL Steam_BGetCallback( int32_t pipe, w_CallbackMsg_t *win_msg, int32_t
 
     TRACE("%u, %p, %p\n", pipe, win_msg, ignored);
 
-    if (!load_steamclient()) return 0;
+    if (!load_steamclient(FALSE)) return 0;
 
     execute_pending_callbacks();
 
@@ -568,7 +598,7 @@ int8_t CDECL Steam_GetAPICallResult( int32_t pipe, uint64_t call, void *w_callba
 
     TRACE( "%u, x, %p, %u, %u, %p\n", pipe, w_callback, w_callback_len, id, failed );
 
-    if (!load_steamclient()) return FALSE;
+    if (!load_steamclient(FALSE)) return FALSE;
     STEAMCLIENT_CALL( steamclient_Steam_GetAPICallResult, &params );
     return params._ret;
 }
@@ -578,7 +608,7 @@ void CDECL Steam_ReleaseThreadLocalMemory(int bThreadExit)
     struct steamclient_Steam_ReleaseThreadLocalMemory_params params = {.thread_exit = bThreadExit};
     TRACE("%d\n", bThreadExit);
 
-    if (!load_steamclient()) return;
+    if (!load_steamclient(TRUE)) return;
 
     STEAMCLIENT_CALL( steamclient_Steam_ReleaseThreadLocalMemory, &params );
 }
@@ -614,7 +644,7 @@ int8_t CDECL Steam_IsKnownInterface( const char *pchVersion )
 {
     struct steamclient_Steam_IsKnownInterface_params params = {.version = pchVersion};
     TRACE("%s\n", pchVersion);
-    load_steamclient();
+    if (!load_steamclient(TRUE)) return FALSE;
     STEAMCLIENT_CALL( steamclient_Steam_IsKnownInterface, &params );
     return params._ret;
 }
@@ -623,12 +653,12 @@ void CDECL Steam_NotifyMissingInterface( int32_t hSteamPipe, const char *pchVers
 {
     struct steamclient_Steam_NotifyMissingInterface_params params = {.pipe = hSteamPipe, .version = pchVersion};
     TRACE("%u %s\n", hSteamPipe, pchVersion);
-    load_steamclient();
+    if (!load_steamclient(TRUE)) return;
     STEAMCLIENT_CALL( steamclient_Steam_NotifyMissingInterface, &params );
 }
 
 void steamclient_init_registry(void)
 {
-    load_steamclient();
+    if (!load_steamclient(TRUE)) return;
     STEAMCLIENT_CALL( steamclient_init_registry, NULL );
 }

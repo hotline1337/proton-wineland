@@ -792,13 +792,14 @@ static NTSTATUS steamclient_init( Params *params, bool wow64 )
 {
     char path[PATH_MAX], resolved_path[PATH_MAX];
     static void *steamclient;
+    static bool initialized;
 
     g_tmppath = params->g_tmppath;
 
     sync_env_var( "SteamAppId", params->steam_app_id_unset, params->steam_app_id );
     sync_env_var( "IgnoreChildProcesses", params->ignore_child_processes_unset, params->ignore_child_processes );
 
-    if (steamclient) return 0;
+    if (initialized) return 0;
 
 #ifdef __APPLE__
     if (getenv( "STEAM_COMPAT_CLIENT_INSTALL_PATH" ))
@@ -830,7 +831,7 @@ static NTSTATUS steamclient_init( Params *params, bool wow64 )
     }
 #endif /* __APPLE__ */
 
-    if (!(steamclient = dlopen( path, RTLD_NOW )))
+    if (!steamclient && !(steamclient = dlopen( path, RTLD_NOW )))
     {
         ERR( "unable to load native steamclient library\n" );
         return -1;
@@ -851,6 +852,7 @@ static NTSTATUS steamclient_init( Params *params, bool wow64 )
     LOAD_FUNC( Steam_IsKnownInterface );
     LOAD_FUNC( Steam_NotifyMissingInterface );
 
+    initialized = true;
     TRACE( "Loaded host steamclient from %s\n", debugstr_a(path) );
     return 0;
 }

@@ -1,0 +1,134 @@
+#include <cassert>
+#include <climits>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <string>
+
+using NTSTATUS = int;
+@PARAMS@
+static char *g_tmppath;
+static std::map<std::string, std::string> environment;
+static unsigned int open_calls, symbol_calls, set_calls, unset_calls;
+static bool fail_open;
+static std::string missing_symbol;
+static const char *const symbols[] = {"CreateInterface", "Steam_BGetCallback", "Steam_GetAPICallResult",
+    "Steam_FreeLastCallback", "Steam_ReleaseThreadLocalMemory", "Steam_IsKnownInterface", "Steam_NotifyMissingInterface"};
+static void (*p_CreateInterface)(), (*p_Steam_BGetCallback)(), (*p_Steam_GetAPICallResult)(),
+    (*p_Steam_FreeLastCallback)(), (*p_Steam_ReleaseThreadLocalMemory)(), (*p_Steam_IsKnownInterface)(),
+    (*p_Steam_NotifyMissingInterface)();
+
+static const char *mock_getenv(const char *name)
+{
+    auto entry = environment.find(name);
+    return entry == environment.end() ? nullptr : entry->second.c_str();
+}
+static int mock_setenv(const char *name, const char *value, int overwrite)
+{
+    assert(overwrite == 1);
+    ++set_calls;
+    environment[name] = value;
+    return 0;
+}
+static int mock_unsetenv(const char *name)
+{
+    ++unset_calls;
+    environment.erase(name);
+    return 0;
+}
+static void *mock_dlopen(const char *path, int)
+{
+    assert(std::strstr(path, "/.steam/sdk"));
+    ++open_calls;
+    return fail_open ? nullptr : reinterpret_cast<void *>(uintptr_t(1));
+}
+static void symbol_stub() {}
+static void *mock_dlsym(void *handle, const char *name)
+{
+    assert(handle == reinterpret_cast<void *>(uintptr_t(1)));
+    ++symbol_calls;
+    if (missing_symbol == name) return nullptr;
+    return reinterpret_cast<void *>(&symbol_stub);
+}
+static char *mock_realpath(const char *, char *) { return nullptr; }
+#define getenv mock_getenv
+#define setenv mock_setenv
+#define unsetenv mock_unsetenv
+#define dlopen mock_dlopen
+#define dlsym mock_dlsym
+#define realpath mock_realpath
+#define RTLD_NOW 2
+#define ERR(...) ((void)0)
+#define WARN(...) ((void)0)
+#define TRACE(...) ((void)0)
+
+@FUNCTIONS@
+
+template<int Tag> struct params_type : steamclient_init_params {};
+
+static void reset()
+{
+    environment = {{"HOME", "/mock-home"}, {"SteamAppId", "stale"}, {"IgnoreChildProcesses", "stale"}};
+    open_calls = symbol_calls = set_calls = unset_calls = 0;
+    fail_open = false;
+    missing_symbol.clear();
+    p_CreateInterface = p_Steam_BGetCallback = p_Steam_GetAPICallResult = p_Steam_FreeLastCallback = nullptr;
+    p_Steam_ReleaseThreadLocalMemory = p_Steam_IsKnownInterface = p_Steam_NotifyMissingInterface = nullptr;
+}
+
+template<int Tag> static void missing_export(unsigned int index)
+{
+    reset();
+    params_type<Tag> params{};
+    params.steam_app_id = "292030";
+    params.ignore_child_processes_unset = 1;
+    missing_symbol = symbols[index];
+    assert(steamclient_init(&params, false) == -1);
+    assert(open_calls == 1 && symbol_calls == index + 1);
+    // A retained library handle must not turn a partial load into success.
+    assert(steamclient_init(&params, false) == -1);
+    assert(open_calls == 1 && symbol_calls == 2 * (index + 1));
+    missing_symbol.clear();
+    assert(!steamclient_init(&params, false));
+    assert(open_calls == 1 && symbol_calls == 2 * (index + 1) + 7);
+    assert(p_CreateInterface && p_Steam_BGetCallback && p_Steam_GetAPICallResult && p_Steam_FreeLastCallback);
+    assert(p_Steam_ReleaseThreadLocalMemory && p_Steam_IsKnownInterface && p_Steam_NotifyMissingInterface);
+    params.steam_app_id_unset = 1;
+    params.steam_app_id = nullptr;
+    params.ignore_child_processes_unset = 0;
+    params.ignore_child_processes = "1";
+    unsigned int resolved = symbol_calls;
+    assert(!steamclient_init(&params, false));
+    assert(open_calls == 1 && symbol_calls == resolved);
+    assert(!environment.count("SteamAppId") && environment.at("IgnoreChildProcesses") == "1");
+}
+
+int main()
+{
+    missing_export<0>(0);
+    missing_export<1>(1);
+    missing_export<2>(2);
+    missing_export<3>(3);
+    missing_export<4>(4);
+    missing_export<5>(5);
+    missing_export<6>(6);
+    reset();
+    params_type<10> params{};
+    params.steam_app_id = "292030";
+    params.ignore_child_processes_unset = 1;
+    char temp[] = "/tmp/test";
+    params.g_tmppath = temp;
+    fail_open = true;
+    assert(steamclient_init(&params, false) == -1);
+    assert(steamclient_init(&params, false) == -1);
+    assert(open_calls == 2 && !symbol_calls);
+    fail_open = false;
+    assert(!steamclient_init(&params, false));
+    assert(open_calls == 3 && symbol_calls == 7 && g_tmppath == temp);
+    assert(environment.at("SteamAppId") == "292030" && !environment.count("IgnoreChildProcesses"));
+    unsigned int sets = set_calls, unsets = unset_calls;
+    assert(!steamclient_init(&params, false));
+    assert(open_calls == 3 && symbol_calls == 7 && sets == set_calls && unsets == unset_calls);
+    std::puts("Unix initialization: dlopen retry, all 7 missing-export retries, completion and resync/unset passed");
+}

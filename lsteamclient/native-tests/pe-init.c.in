@@ -1,0 +1,207 @@
+#define _GNU_SOURCE
+#include <assert.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <uchar.h>
+
+typedef int BOOL;
+typedef int32_t LONG;
+typedef uint32_t DWORD;
+typedef char16_t WCHAR;
+typedef struct { int unused; } WSADATA;
+#define TRUE 1
+#define FALSE 0
+#define ReadAcquire(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define WriteRelease(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
+#define EnterCriticalSection(p) assert(!pthread_mutex_lock(p))
+#define LeaveCriticalSection(p) assert(!pthread_mutex_unlock(p))
+enum { unix_steamclient_init = 17 };
+
+@PARAMS@
+
+static pthread_mutex_t steamclient_init_cs;
+static BOOL wsa_initialized, steamclient_initializing;
+static LONG steamclient_initialized;
+static char temp_path_buffer[64];
+static _Thread_local DWORD last_error;
+static unsigned int env_calls, init_calls, wsa_calls;
+static int fail_init, reenter_init, reentry_checked, exports_complete;
+static const char *win_app, *win_ignore;
+static char synced_app[4096], synced_ignore[4096];
+static int app_unset, ignore_unset;
+static int load_steamclient(BOOL sync_environment);
+
+static DWORD GetLastError(void) { return last_error; }
+static void SetLastError(DWORD value) { last_error = value; }
+
+static DWORD GetEnvironmentVariableW(const WCHAR *name, WCHAR *value, unsigned int size)
+{
+    const char *source = name[0] == 'S' ? win_app : win_ignore;
+    size_t i, length;
+    ++env_calls;
+    SetLastError(203);
+    if (!source || !*source) return 0;
+    length = strlen(source);
+    if (length >= size) return length + 1;
+    for (i = 0; i <= length; ++i) value[i] = (unsigned char)source[i];
+    return length;
+}
+
+static int WSAStartup(unsigned int version, WSADATA *data)
+{
+    assert(version == 0x202 && data);
+    ++wsa_calls;
+    SetLastError(204);
+    return 0;
+}
+
+static int mock_unix_init(const struct steamclient_init_params *params)
+{
+    ++init_calls;
+    app_unset = params->steam_app_id_unset;
+    ignore_unset = params->ignore_child_processes_unset;
+    snprintf(synced_app, sizeof(synced_app), "%s", params->steam_app_id ? params->steam_app_id : "");
+    snprintf(synced_ignore, sizeof(synced_ignore), "%s",
+             params->ignore_child_processes ? params->ignore_child_processes : "");
+    if (reenter_init)
+    {
+        assert(!load_steamclient(FALSE));
+        assert(!load_steamclient(TRUE));
+        assert(!ReadAcquire(&steamclient_initialized));
+        ++reentry_checked;
+    }
+    SetLastError(205);
+    if (fail_init) return -1;
+    exports_complete = 1;
+    return 0;
+}
+
+static int steamclient_call(unsigned int code, void *args, const char *name)
+{
+    assert(code == unix_steamclient_init);
+    assert(!strcmp(name, "steamclient_init"));
+    return mock_unix_init(args);
+}
+
+@FUNCTIONS@
+
+static void reset(void)
+{
+    steamclient_initialized = steamclient_initializing = wsa_initialized = 0;
+    env_calls = init_calls = wsa_calls = 0;
+    fail_init = reenter_init = reentry_checked = exports_complete = 0;
+    win_app = "292030";
+    win_ignore = NULL;
+    SetLastError(1234);
+}
+
+static pthread_barrier_t start;
+
+static void *concurrent_init(void *arg)
+{
+    DWORD error = 2000 + (uintptr_t)arg;
+    SetLastError(error);
+    pthread_barrier_wait(&start);
+    assert(load_steamclient(FALSE));
+    assert(exports_complete && ReadAcquire(&steamclient_initialized));
+    assert(GetLastError() == error);
+    return NULL;
+}
+
+static double now(void)
+{
+    struct timespec time;
+    assert(!clock_gettime(CLOCK_MONOTONIC, &time));
+    return time.tv_sec + time.tv_nsec * 1e-9;
+}
+
+static __attribute__((noinline)) int benchmark_call(BOOL sync_environment)
+{
+    return load_steamclient(sync_environment);
+}
+
+static void benchmark(void)
+{
+    const unsigned int count = 1000000;
+    volatile unsigned int completed = 0;
+    unsigned int i, iteration;
+    double cached, sync, begin;
+    reset();
+    assert(load_steamclient(FALSE));
+    for (iteration = 0; iteration < 7; ++iteration)
+    {
+        begin = now();
+        for (i = 0; i < count; ++i) completed += benchmark_call(FALSE);
+        cached = (now() - begin) * 1e9 / count;
+        begin = now();
+        for (i = 0; i < count; ++i) completed += benchmark_call(TRUE);
+        sync = (now() - begin) * 1e9 / count;
+        printf("Mock batch %u: cached %.3f ns/call, forced sync %.3f ns/call\n", iteration + 1, cached, sync);
+    }
+    assert(completed == 14 * count);
+    puts("Synthetic function/mocking overhead only. Not Wine environment-scan or game loading time.");
+}
+
+int main(int argc, char **argv)
+{
+    pthread_mutexattr_t attributes;
+    pthread_t threads[8];
+    unsigned int i;
+    char oversized[3000];
+    assert(!pthread_mutexattr_init(&attributes));
+    assert(!pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_RECURSIVE));
+    assert(!pthread_mutex_init(&steamclient_init_cs, &attributes));
+    assert(!pthread_mutexattr_destroy(&attributes));
+    reset();
+    assert(load_steamclient(FALSE));
+    assert(env_calls == 2 && init_calls == 1 && wsa_calls == 1);
+    assert(!strcmp(synced_app, "292030") && !app_unset && ignore_unset);
+    assert(GetLastError() == 1234);
+    for (i = 0; i < 100000; ++i) assert(load_steamclient(FALSE));
+    assert(env_calls == 2 && init_calls == 1 && wsa_calls == 1);
+    assert(GetLastError() == 1234);
+    win_app = "123";
+    win_ignore = "1";
+    assert(load_steamclient(TRUE));
+    assert(!strcmp(synced_app, "123") && !strcmp(synced_ignore, "1"));
+    assert(env_calls == 4 && init_calls == 2 && wsa_calls == 1);
+    assert(GetLastError() == 1234);
+    win_app = win_ignore = NULL;
+    assert(load_steamclient(TRUE));
+    assert(app_unset && ignore_unset && !*synced_app && !*synced_ignore);
+    memset(oversized, 'x', sizeof(oversized) - 1);
+    oversized[sizeof(oversized) - 1] = 0;
+    win_app = oversized;
+    assert(load_steamclient(TRUE));
+    assert(app_unset);
+    reset();
+    fail_init = 1;
+    assert(!load_steamclient(FALSE));
+    assert(!steamclient_initialized && !steamclient_initializing && !wsa_calls);
+    assert(!load_steamclient(FALSE));
+    assert(env_calls == 4 && init_calls == 2);
+    fail_init = 0;
+    SetLastError(777);
+    assert(load_steamclient(FALSE));
+    assert(env_calls == 6 && init_calls == 3 && wsa_calls == 1);
+    assert(GetLastError() == 777);
+    reset();
+    reenter_init = 1;
+    assert(load_steamclient(FALSE));
+    assert(reentry_checked == 1 && env_calls == 2 && init_calls == 1 && wsa_calls == 1);
+    reset();
+    assert(!pthread_barrier_init(&start, NULL, 9));
+    for (i = 0; i < 8; ++i) assert(!pthread_create(threads + i, NULL, concurrent_init, (void *)(uintptr_t)i));
+    pthread_barrier_wait(&start);
+    for (i = 0; i < 8; ++i) assert(!pthread_join(threads[i], NULL));
+    assert(!pthread_barrier_destroy(&start));
+    assert(env_calls == 2 && init_calls == 1 && wsa_calls == 1);
+    puts("PE initialization: cached callbacks, resync/unset, errors/retry, reentry and 8-thread publication passed");
+    if (argc == 2 && !strcmp(argv[1], "--benchmark")) benchmark();
+    assert(!pthread_mutex_destroy(&steamclient_init_cs));
+    return 0;
+}
