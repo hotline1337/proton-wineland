@@ -1,0 +1,129 @@
+name: Sync To Upstream
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # codziennie o 3:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    name: Sync all branches and tags from upstream
+    runs-on: ubuntu-slim
+    permissions:
+      contents: write
+    env:
+      UPSTREAM_REPO: https://github.com/nanomatters/proton-cachyos.git
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Configure git identity
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Add upstream & fetch all refs
+      run: |
+        git remote add upstream "$UPSTREAM_REPO"
+        git config --add remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+        git fetch origin --prune
+        git fetch upstream --prune "+refs/heads/*:refs/remotes/upstream/*"
+
+    - name: Reset master to upstream + own workflow files
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # Jedyne pliki, które istnieją tylko w forku
+        KEEP_FILES=(
+          ".github/workflows/sync-to-upstream.yml"
+          ".github/workflows/snapshot-v3.yml"
+        )
+
+        if ! git show-ref --verify --quiet refs/remotes/upstream/master; then
+          echo "::error::upstream nie ma brancha master"
+          exit 1
+        fi
+
+        # Zapisz własne pliki z aktualnego origin/master
+        keep_dir="$(mktemp -d)"
+        for f in "${KEEP_FILES[@]}"; do
+          mkdir -p "$keep_dir/$(dirname "$f")"
+          git show "refs/remotes/origin/master:$f" > "$keep_dir/$f"
+        done
+
+        # master = dokładnie upstream/master (bez rebase, więc bez konfliktów)
+        git checkout -f -B master refs/remotes/upstream/master
+
+        # Dołóż własne pliki na wierzch
+        for f in "${KEEP_FILES[@]}"; do
+          mkdir -p "$(dirname "$f")"
+          cp "$keep_dir/$f" "$f"
+        done
+        git add -- "${KEEP_FILES[@]}"
+
+        if ! git diff --cached --quiet; then
+          # Stała data = data commita z upstreamu, dzięki czemu SHA jest
+          # deterministyczny i przy braku zmian w upstream push nic nie zmienia
+          commit_date="$(git log -1 --format=%cI refs/remotes/upstream/master)"
+          GIT_AUTHOR_DATE="$commit_date" GIT_COMMITTER_DATE="$commit_date" \
+            git commit -m "Add fork workflows (sync-to-upstream, snapshot-v3)"
+        fi
+
+        git push origin master --force-with-lease=master:refs/remotes/origin/master
+
+    - name: Sync other branches
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # 1. Push nowych i zaktualizowanych branchy (z pominięciem mastera)
+        sync_refs=()
+        for ref in $(git for-each-ref --format='%(refname:strip=3)' refs/remotes/upstream/); do
+          if [ "$ref" = "HEAD" ] || [ "$ref" = "master" ]; then
+            continue
+          fi
+          sync_refs+=("refs/remotes/upstream/$ref:refs/heads/$ref")
+        done
+
+        if [ ${#sync_refs[@]} -gt 0 ]; then
+          echo "Pushowanie branchy z upstream do origin..."
+          git push origin --force "${sync_refs[@]}"
+        fi
+
+        # 2. Usuwanie branchy z origin, które zniknęły na upstream
+        del_refs=()
+        for ref in $(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin/); do
+          if [ "$ref" = "HEAD" ] || [ "$ref" = "master" ]; then
+            continue
+          fi
+          if ! git show-ref --verify --quiet "refs/remotes/upstream/$ref"; then
+            echo "Wykryto usunięty branch: $ref"
+            del_refs+=("$ref")
+          fi
+        done
+
+        if [ ${#del_refs[@]} -gt 0 ]; then
+          echo "Usuwanie starych branchy z origin..."
+          git push origin --delete "${del_refs[@]}"
+        fi
+
+    - name: Sync tags
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # Usunięcie lokalnych tagów z checkoutu, by uniknąć wiszących referencji
+        git tag -l | xargs -r git tag -d
+
+        # Pobranie aktualnego stanu tagów z upstream
+        git fetch upstream --tags
+        git push origin --force --prune 'refs/tags/*:refs/tags/*'
