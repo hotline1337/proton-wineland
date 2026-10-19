@@ -1,0 +1,12 @@
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -2423,7 +2423,7 @@
+    memcpy(p->driverUUID, pdev->driver_uuid, VK_UUID_SIZE);
+    memset(p->deviceLUID, 0, VK_LUID_SIZE);
+ 
+-   snprintf(p->driverName, VK_MAX_DRIVER_NAME_SIZE, "radv");
++   snprintf(p->driverName, VK_MAX_DRIVER_NAME_SIZE, "radv-salkim");
+    snprintf(p->driverInfo, VK_MAX_DRIVER_INFO_SIZE, "Mesa " PACKAGE_VERSION MESA_GIT_SHA1 "%s",
+             radv_get_compiler_string(pdev));
+ 

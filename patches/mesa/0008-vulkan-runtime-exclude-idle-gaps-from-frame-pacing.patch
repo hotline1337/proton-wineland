@@ -1,0 +1,381 @@
+From 3a3bf9ed53351832e21e1bc538ca7b134589bd76 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Sun, 18 Oct 2026 14:28:57 +0200
+Subject: [PATCH] vulkan/runtime: exclude idle gaps from frame pacing
+
+---
+ src/amd/vulkan/radv_anti_lag.c      |   7 +-
+ src/vulkan/runtime/vk_frame_pacer.c | 210 ++++++++++++++--------------
+ src/vulkan/runtime/vk_frame_pacer.h |   3 -
+ 3 files changed, 106 insertions(+), 114 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_anti_lag.c b/src/amd/vulkan/radv_anti_lag.c
+index d31039debed..f2dff0395e9 100644
+--- a/src/amd/vulkan/radv_anti_lag.c
++++ b/src/amd/vulkan/radv_anti_lag.c
+@@ -25,10 +25,7 @@ frame_time_cb(const struct vk_frame_time_info *info, void *_)
+ {
+    struct anti_lag_data *data = _;
+    if (info->frame_time) {
+-      /* Calculate average absolute deviation as exponential moving average with alpha = 0.125.
+-       * Total frame time being time from first QueueSubmit is made until all GPU work is drained
+-       * on the GPU.
+-       */
++      /* Calculate average absolute deviation as exponential moving average with alpha = 0.125. */
+       int64_t expected_total_frame_time = data->queuing_delay + data->avg_frame_time;
+       int64_t current_total_frame_time = info->min_delay + info->frame_time;
+       int64_t deviation = expected_total_frame_time - current_total_frame_time;
+@@ -150,4 +147,4 @@ radv_AntiLagUpdateAMD(VkDevice _device, const VkAntiLagDataAMD *pData)
+ 
+    /* Sleep until deadline is met. */
+    os_time_nanosleep_until(next_deadline);
+-}
+\ No newline at end of file
++}
+diff --git a/src/vulkan/runtime/vk_frame_pacer.c b/src/vulkan/runtime/vk_frame_pacer.c
+index 52255e3479c..d94509d4f32 100644
+--- a/src/vulkan/runtime/vk_frame_pacer.c
++++ b/src/vulkan/runtime/vk_frame_pacer.c
+@@ -17,6 +17,11 @@
+ #define MAX_SUBMISSIONS 256
+ #define MAX_QUERIES     (MAX_SUBMISSIONS * 2)
+ 
++struct submit_interval {
++   uint64_t begin;
++   uint64_t end;
++};
++
+ struct query {
+    uint64_t submit_ts;
+    uint64_t gpu_ts;
+@@ -53,9 +58,37 @@ struct vk_frame_pacer {
+ 
+    PFN_vkQueueSubmit2 queue_submit2;
+    PFN_vkQueuePresentKHR queue_present;
++   struct submit_interval *intervals;
+    queue_context queue_ctx_data[];
+ };
+ 
++static int
++compare_submit_intervals(const void *a, const void *b)
++{
++   const struct submit_interval *left = a;
++   const struct submit_interval *right = b;
++   return (left->begin > right->begin) - (left->begin < right->begin);
++}
++
++static uint64_t
++submit_intervals_duration(struct submit_interval *intervals, uint32_t count)
++{
++   if (!count)
++      return 0;
++
++   qsort(intervals, count, sizeof(*intervals), compare_submit_intervals);
++
++   uint64_t duration = 0;
++   uint64_t end = intervals[0].begin;
++   for (uint32_t i = 0; i < count; i++) {
++      const uint64_t begin = MAX2(end, intervals[i].begin);
++      if (intervals[i].end > begin)
++         duration += intervals[i].end - begin;
++      end = MAX2(end, intervals[i].end);
++   }
++   return duration;
++}
++
+ void
+ vk_frame_pacer_calibrate(struct vk_frame_pacer *frame_pacer)
+ {
+@@ -111,9 +144,7 @@ evaluate_frame(struct vk_frame_pacer *frame_pacer, struct vk_frame_time_info *fr
+          return false;
+    }
+ 
+-   uint64_t cpu_start_time = UINT64_MAX;
+-   uint64_t gpu_start_time = UINT64_MAX;
+-   uint64_t gpu_end_time = 0;
++   uint32_t num_intervals = 0;
+    int64_t min_delay = INT64_MAX;
+ 
+    /* For each queue, retrieve timestamp query results. */
+@@ -135,9 +166,6 @@ evaluate_frame(struct vk_frame_pacer *frame_pacer, struct vk_frame_time_info *fr
+             VK_QUERY_RESULT_64_BIT);
+          assert(res == VK_SUCCESS);
+ 
+-         gpu_start_time = MIN2(gpu_start_time, query_begin->gpu_ts);
+-         cpu_start_time = MIN2(cpu_start_time, query_begin->submit_ts);
+-
+          for (unsigned i = 0; i < num_timestamps; i += 2) {
+             /* Calibrate GPU begin timestamp. */
+             uint64_t begin_gpu_ts =
+@@ -151,10 +179,11 @@ evaluate_frame(struct vk_frame_pacer *frame_pacer, struct vk_frame_time_info *fr
+ 
+             /* Even timestamps mark the begin and odd timestamps mark the end of each submission. */
+             struct query *query_end = ringbuffer_next(queue_ctx->queries, query_begin);
++            frame_pacer->intervals[num_intervals++] = (struct submit_interval) {
++               .begin = query_begin->gpu_ts,
++               .end = query_end->gpu_ts,
++            };
+             query_begin = ringbuffer_next(queue_ctx->queries, query_end);
+-
+-            /* Take the maximum of all GPU end timestamps. */
+-            gpu_end_time = MAX2(gpu_end_time, query_end->gpu_ts);
+          }
+ 
+          /* Reset Query Pool. */
+@@ -183,8 +212,8 @@ evaluate_frame(struct vk_frame_pacer *frame_pacer, struct vk_frame_time_info *fr
+    }
+ 
+    /* Populate vk_frame_time_info. */
+-   if (gpu_end_time) {
+-      frame->frame_time = (double)(gpu_end_time - gpu_start_time) *
++   if (num_intervals) {
++      frame->frame_time = (double)submit_intervals_duration(frame_pacer->intervals, num_intervals) *
+                           (double)frame_pacer->calibration.timestamp_period;
+       /* Cap the measured frame time at 10 FPS, in order to keep the application
+        * usable if anything went wrong.
+@@ -302,34 +331,34 @@ get_timestamp_queries(struct vk_frame_pacer *frame_pacer, struct queue_context *
+ }
+ 
+ static VkResult
+-frame_pacer_submit(struct vk_frame_pacer *frame_pacer, VkQueue _queue, uint32_t submitCount,
+-                   const VkSubmitInfo2 *pSubmits, VkFence fence, bool early_submit, uint32_t first,
+-                   VkCommandBuffer timestamps[2], VkSemaphoreSubmitInfo *semaphore_info)
++frame_pacer_prepare_submit(struct vk_frame_pacer *frame_pacer, queue_context *queue_ctx,
++                           uint32_t submitCount, const VkSubmitInfo2 *pSubmits,
++                           VkSubmitInfo2 **out_submits)
+ {
++   *out_submits = NULL;
++
++   uint32_t frame_idx = ringbuffer_index(frame_pacer->frames, frame_pacer->active_frame);
++   uint32_t available = MIN2(MAX_SUBMISSIONS / 2 - queue_ctx->num_submits[frame_idx],
++                             (MAX_QUERIES - queue_ctx->queries.size) / 2);
++   uint32_t tracked_count = 0;
++   size_t command_buffer_count = 0;
++   for (uint32_t i = 0; i < submitCount && tracked_count < available; i++) {
++      if (!pSubmits[i].commandBufferInfoCount ||
++          (pSubmits[i].flags & VK_SUBMIT_PROTECTED_BIT))
++         continue;
++      tracked_count++;
++      command_buffer_count += (size_t)pSubmits[i].commandBufferInfoCount + 2;
++   }
++
++   if (!tracked_count)
++      return VK_SUCCESS;
++
+    VkSubmitInfo2 *submits;
+-   VkCommandBufferSubmitInfo *cmdbuffers_begin;
+-   VkCommandBufferSubmitInfo *cmdbuffers_end;
++   VkCommandBufferSubmitInfo *cmdbuffers;
+    VkSemaphoreSubmitInfo *semaphores;
+    VK_MULTIALLOC(ma);
+-
+-   if (early_submit) {
+-      vk_multialloc_add(&ma, &submits, VkSubmitInfo2, submitCount + 1);
+-      vk_multialloc_add(&ma, &cmdbuffers_begin, VkCommandBufferSubmitInfo, 1);
+-      vk_multialloc_add(&ma, &cmdbuffers_end, VkCommandBufferSubmitInfo,
+-                        pSubmits[submitCount - 1].commandBufferInfoCount + 1);
+-      first = 0;
+-   } else {
+-      vk_multialloc_add(&ma, &submits, VkSubmitInfo2, submitCount);
+-      if (first == submitCount - 1) {
+-         vk_multialloc_add(&ma, &cmdbuffers_begin, VkCommandBufferSubmitInfo,
+-                           pSubmits[first].commandBufferInfoCount + 2);
+-      } else {
+-         vk_multialloc_add(&ma, &cmdbuffers_begin, VkCommandBufferSubmitInfo,
+-                           pSubmits[first].commandBufferInfoCount + 1);
+-         vk_multialloc_add(&ma, &cmdbuffers_end, VkCommandBufferSubmitInfo,
+-                           pSubmits[submitCount - 1].commandBufferInfoCount + 1);
+-      }
+-   }
++   vk_multialloc_add(&ma, &submits, VkSubmitInfo2, submitCount);
++   vk_multialloc_add(&ma, &cmdbuffers, VkCommandBufferSubmitInfo, command_buffer_count);
+    vk_multialloc_add(&ma, &semaphores, VkSemaphoreSubmitInfo,
+                      pSubmits[submitCount - 1].signalSemaphoreInfoCount + 1);
+ 
+@@ -338,56 +367,47 @@ frame_pacer_submit(struct vk_frame_pacer *frame_pacer, VkQueue _queue, uint32_t
+    if (!buf)
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+ 
+-   if (early_submit) {
+-      memcpy(submits + 1, pSubmits, sizeof(VkSubmitInfo2) * submitCount);
+-      submits[0] = (VkSubmitInfo2){.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+-      submitCount++;
+-   } else {
+-      memcpy(submits, pSubmits, sizeof(VkSubmitInfo2) * submitCount);
+-   }
++   memcpy(submits, pSubmits, sizeof(VkSubmitInfo2) * submitCount);
+ 
+-   VkSubmitInfo2 *submit_info = &submits[first];
++   VkSemaphoreSubmitInfo semaphore_info = {0};
++   uint32_t tracked = 0;
++   for (uint32_t i = 0; i < submitCount && tracked < tracked_count; i++) {
++      VkSubmitInfo2 *submit_info = &submits[i];
++      if (!submit_info->commandBufferInfoCount ||
++          (submit_info->flags & VK_SUBMIT_PROTECTED_BIT))
++         continue;
+ 
+-   /* Add timestamp commandbuffer before first submission. */
+-   cmdbuffers_begin[0] = (VkCommandBufferSubmitInfo){
+-      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+-      .commandBuffer = timestamps[0],
+-   };
+-   memcpy(&cmdbuffers_begin[1], submit_info->pCommandBufferInfos,
+-          sizeof(VkCommandBufferSubmitInfo) * submit_info->commandBufferInfoCount);
+-   submit_info->pCommandBufferInfos = cmdbuffers_begin;
+-   submit_info->commandBufferInfoCount++;
+-
+-   /* Add timestamp commandbuffer after last submission. */
+-   submit_info = &submits[submitCount - 1];
+-   if (first == submitCount - 1) {
+-      cmdbuffers_begin[submit_info->commandBufferInfoCount] = (VkCommandBufferSubmitInfo){
++      VkCommandBuffer timestamps[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
++      ASSERTED bool have_queries =
++         get_timestamp_queries(frame_pacer, queue_ctx, timestamps, &semaphore_info);
++      assert(have_queries);
++
++      cmdbuffers[0] = (VkCommandBufferSubmitInfo){
+          .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+-         .commandBuffer = timestamps[1],
++         .commandBuffer = timestamps[0],
+       };
+-   } else {
+-      memcpy(&cmdbuffers_end[0], submit_info->pCommandBufferInfos,
++      memcpy(&cmdbuffers[1], submit_info->pCommandBufferInfos,
+              sizeof(VkCommandBufferSubmitInfo) * submit_info->commandBufferInfoCount);
+-      cmdbuffers_end[submit_info->commandBufferInfoCount] = (VkCommandBufferSubmitInfo){
++      cmdbuffers[submit_info->commandBufferInfoCount + 1] = (VkCommandBufferSubmitInfo){
+          .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+          .commandBuffer = timestamps[1],
+       };
+-      submit_info->pCommandBufferInfos = cmdbuffers_end;
++      submit_info->pCommandBufferInfos = cmdbuffers;
++      submit_info->commandBufferInfoCount += 2;
++      cmdbuffers += submit_info->commandBufferInfoCount;
++      tracked++;
+    }
+-   submit_info->commandBufferInfoCount++;
+ 
+-   /* Add timeline semaphore to last submission. */
+-   memcpy(semaphores, submit_info->pSignalSemaphoreInfos,
+-          sizeof(VkSemaphoreSubmitInfo) * submit_info->signalSemaphoreInfoCount);
+-   semaphores[submit_info->signalSemaphoreInfoCount] = *semaphore_info;
++   VkSubmitInfo2 *submit_info = &submits[submitCount - 1];
++   if (submit_info->signalSemaphoreInfoCount)
++      memcpy(semaphores, submit_info->pSignalSemaphoreInfos,
++             sizeof(VkSemaphoreSubmitInfo) * submit_info->signalSemaphoreInfoCount);
++   semaphores[submit_info->signalSemaphoreInfoCount] = semaphore_info;
+    submit_info->pSignalSemaphoreInfos = semaphores;
+    submit_info->signalSemaphoreInfoCount++;
+ 
+-   /* Submit with added timestamp query commandbuffers. */
+-   VkResult res = frame_pacer->queue_submit2(_queue, submitCount, submits, fence);
+-
+-   vk_free(&frame_pacer->device->alloc, submits);
+-   return res;
++   *out_submits = submits;
++   return VK_SUCCESS;
+ }
+ 
+ VKAPI_ATTR static VkResult VKAPI_CALL
+@@ -401,20 +421,6 @@ frame_pacer_QueueSubmit2(VkQueue _queue, uint32_t submitCount, const VkSubmitInf
+    if (!p_atomic_read(&frame_pacer->enabled) || !submitCount)
+       return frame_pacer->queue_submit2(_queue, submitCount, pSubmits, fence);
+ 
+-   bool has_wait_before_cmdbuffer = false;
+-   int first = -1;
+-
+-   /* Check if any submission contains commandbuffers. */
+-   for (unsigned i = 0; i < submitCount; i++) {
+-      if (pSubmits[i].waitSemaphoreInfoCount != 0)
+-         has_wait_before_cmdbuffer = true;
+-
+-      if (pSubmits[i].commandBufferInfoCount) {
+-         first = i;
+-         break;
+-      }
+-   }
+-
+    /* Begin critical section. */
+    ringbuffer_lock(frame_pacer->frames);
+ 
+@@ -427,25 +433,15 @@ frame_pacer_QueueSubmit2(VkQueue _queue, uint32_t submitCount, const VkSubmitInf
+    struct queue_context *queue_ctx = entry->data;
+    ringbuffer_lock(queue_ctx->queries);
+ 
+-   /* Don't record timestamps for queues that are not deemed sensitive to latency. */
+-   bool need_query = frame_pacer->active_frame && p_atomic_read(&queue_ctx->latency_sensitive);
+-
+-   /* For the very first submissions in a frame (until we observe real GPU work happening),
+-    * we would want to submit a timestamp before anything else, including waits.
+-    * This allows us to detect a sensitive queue going idle before we can submit work to it.
+-    * If the queue in question depends on semaphores from other unrelated queues,
+-    * we may not easily be able to detect that situation without adding a lot more complexity.
+-    */
+-   uint32_t frame_idx = ringbuffer_index(frame_pacer->frames, frame_pacer->active_frame);
+-   bool early_submit = has_wait_before_cmdbuffer && queue_ctx->num_submits[frame_idx] == 0;
+-   need_query &= (first >= 0 || early_submit);
+-
+-   /* Get timestamp commandbuffers. */
+-   VkCommandBuffer timestamps[2];
+-   VkSemaphoreSubmitInfo semaphore_info;
+-   if (!need_query || !get_timestamp_queries(frame_pacer, queue_ctx, timestamps, &semaphore_info)) {
++   VkSubmitInfo2 *submits = NULL;
++   VkResult res = VK_SUCCESS;
++   if (p_atomic_read(&queue_ctx->latency_sensitive))
++      res = frame_pacer_prepare_submit(frame_pacer, queue_ctx, submitCount, pSubmits, &submits);
++   if (res != VK_SUCCESS || !submits) {
+       ringbuffer_unlock(queue_ctx->queries);
+       ringbuffer_unlock(frame_pacer->frames);
++      if (res != VK_SUCCESS)
++         return res;
+       return frame_pacer->queue_submit2(_queue, submitCount, pSubmits, fence);
+    }
+ 
+@@ -458,9 +454,8 @@ frame_pacer_QueueSubmit2(VkQueue _queue, uint32_t submitCount, const VkSubmitInf
+       ringbuffer_unlock(queue_ctx->queries);
+    ringbuffer_unlock(frame_pacer->frames);
+ 
+-   /* Submit with added timestamp query commandbuffers. */
+-   VkResult res = frame_pacer_submit(frame_pacer, _queue, submitCount, pSubmits, fence,
+-                                     early_submit, first, timestamps, &semaphore_info);
++   res = frame_pacer->queue_submit2(_queue, submitCount, submits, fence);
++   vk_free(&frame_pacer->device->alloc, submits);
+ 
+    /* For internally synchronized queues, make sure that the submissions are kept
+     * in-order, so that the semaphore can't get destroyed before the submission
+@@ -711,11 +706,13 @@ vk_frame_pacer_init(struct vk_device *device, vk_frame_time_cb update_cb, size_t
+    /* Allocate the context. */
+    struct vk_frame_pacer *frame_pacer;
+    queue_context *queues;
++   struct submit_interval *intervals;
+    uint8_t *user_data;
+    unsigned num_queues = list_length(&device->queues);
+    VK_MULTIALLOC(ma);
+    vk_multialloc_add(&ma, &frame_pacer, struct vk_frame_pacer, 1);
+    vk_multialloc_add(&ma, &queues, queue_context, num_queues);
++   vk_multialloc_add(&ma, &intervals, struct submit_interval, num_queues * (MAX_SUBMISSIONS / 2));
+    vk_multialloc_add_size(&ma, &user_data, uint8_t, data_size);
+    void *buf = vk_multialloc_zalloc(&ma, &device->alloc, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+    if (!buf)
+@@ -728,6 +725,7 @@ vk_frame_pacer_init(struct vk_device *device, vk_frame_time_cb update_cb, size_t
+    _mesa_pointer_hash_table_init(&frame_pacer->queues, NULL);
+    frame_pacer->update = update_cb;
+    frame_pacer->user_data = user_data;
++   frame_pacer->intervals = intervals;
+ 
+    /* Update dispatch table. */
+    frame_pacer->queue_submit2 = device->dispatch_table.QueueSubmit2;
+diff --git a/src/vulkan/runtime/vk_frame_pacer.h b/src/vulkan/runtime/vk_frame_pacer.h
+index d5b277ee02c..45e2d65bd8c 100644
+--- a/src/vulkan/runtime/vk_frame_pacer.h
++++ b/src/vulkan/runtime/vk_frame_pacer.h
+@@ -57,9 +57,6 @@ extern "C" {
+ struct vk_frame_pacer;
+ 
+ struct vk_frame_time_info {
+-   /* Frame time as measured from before the first submission until after the
+-    * last submission, associated with a frame.
+-    */
+    uint64_t frame_time;
+    /* The minimum queuing-delay as measured between QueueSubmit2 and the
+     * execution of the submission on the GPU.

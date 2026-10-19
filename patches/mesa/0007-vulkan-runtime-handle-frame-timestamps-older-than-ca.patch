@@ -1,0 +1,32 @@
+From b3abc4c58f3dd0e6d1a18ed664ef125bfe2e39d5 Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Sun, 18 Oct 2026 14:18:26 +0200
+Subject: [PATCH] vulkan/runtime: handle frame timestamps older than
+ calibration
+
+---
+ src/vulkan/runtime/vk_frame_pacer.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/vulkan/runtime/vk_frame_pacer.c b/src/vulkan/runtime/vk_frame_pacer.c
+index f116e85eafb..52255e3479c 100644
+--- a/src/vulkan/runtime/vk_frame_pacer.c
++++ b/src/vulkan/runtime/vk_frame_pacer.c
+@@ -142,8 +142,8 @@ evaluate_frame(struct vk_frame_pacer *frame_pacer, struct vk_frame_time_info *fr
+             /* Calibrate GPU begin timestamp. */
+             uint64_t begin_gpu_ts =
+                frame_pacer->calibration.base_host_ts +
+-               (uint64_t)((double)(query_begin->gpu_ts - frame_pacer->calibration.base_device_ts) *
+-                          (double)frame_pacer->calibration.timestamp_period);
++               (int64_t)((double)(int64_t)(query_begin->gpu_ts - frame_pacer->calibration.base_device_ts) *
++                         (double)frame_pacer->calibration.timestamp_period);
+ 
+             /* This value might be negative due to timestamp inaccuracies. */
+             int64_t submission_delay = begin_gpu_ts - query_begin->submit_ts;
+@@ -736,4 +736,4 @@ vk_frame_pacer_init(struct vk_device *device, vk_frame_time_cb update_cb, size_t
+    device->dispatch_table.QueuePresentKHR = frame_pacer_QueuePresentKHR;
+ 
+    return VK_SUCCESS;
+-}
+\ No newline at end of file
++}

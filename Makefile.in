@@ -193,6 +193,10 @@ include $(SRC)/steamrtdeps/build-speexdsp.mk
 include $(SRC)/steamrtdeps/build-flac.mk
 endif # WITHOUT_STEAMRT_DEPENDS
 
+ifeq ($(TARGET_ARCH),x86_64)
+include $(SRC)/make/build-mesa.mk
+endif
+
 
 ##
 ## dav1d

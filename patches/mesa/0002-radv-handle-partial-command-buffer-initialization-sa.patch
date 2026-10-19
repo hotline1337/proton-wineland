@@ -1,0 +1,47 @@
+From 4467df3058d5e40da2aec0aa2d3d9c4ce54cf76f Mon Sep 17 00:00:00 2001
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Date: Sat, 26 Sep 2026 10:44:23 +0200
+Subject: [PATCH] radv: handle partial command buffer initialization safely
+
+Initialize the transient list before command stream creation can fail.
+Skip acceleration-structure cleanup when its set has not been allocated,
+and handle failure to allocate that set through the cleanup path.
+---
+ src/amd/vulkan/radv_cmd_buffer.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index d7f0a3c8f27..f98a83e3054 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -1314,7 +1314,8 @@ radv_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
+ 
+       radv_destroy_msrtss_transients(cmd_buffer);
+ 
+-      radv_rra_accel_struct_buffers_unref(device, cmd_buffer->accel_struct_buffers);
++      if (cmd_buffer->accel_struct_buffers)
++         radv_rra_accel_struct_buffers_unref(device, cmd_buffer->accel_struct_buffers);
+       _mesa_set_destroy(cmd_buffer->accel_struct_buffers, NULL);
+ 
+       list_for_each_entry_safe (struct radv_cmd_buffer_upload, up, &cmd_buffer->upload.list, list) {
+@@ -1391,6 +1392,7 @@ radv_create_cmd_buffer(struct vk_command_pool *pool, VkCommandBufferLevel level,
+    if (cmd_buffer->qf != RADV_QUEUE_SPARSE) {
+       const enum amd_ip_type ip = radv_queue_family_to_ring(pdev, cmd_buffer->qf);
+       list_inithead(&cmd_buffer->upload.list);
++      list_inithead(&cmd_buffer->msrtss_transients);
+ 
+       radv_cmd_buffer_init_shader_part_cache(device, cmd_buffer);
+       result =
+@@ -1404,8 +1406,11 @@ radv_create_cmd_buffer(struct vk_command_pool *pool, VkCommandBufferLevel level,
+          vk_object_base_init(&device->vk, &cmd_buffer->descriptors[i].push_set.set.base, VK_OBJECT_TYPE_DESCRIPTOR_SET);
+ 
+       cmd_buffer->accel_struct_buffers = _mesa_pointer_set_create(NULL);
++      if (!cmd_buffer->accel_struct_buffers) {
++         radv_destroy_cmd_buffer(&cmd_buffer->vk);
++         return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
++      }
+       cmd_buffer->ray_history = UTIL_DYNARRAY_INIT;
+-      list_inithead(&cmd_buffer->msrtss_transients);
+    }
+ 
+    if (device->utrace.context) {
