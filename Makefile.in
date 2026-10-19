@@ -2038,6 +2038,9 @@ $(DESKTOP_MONITOR_TARGET): $(addprefix $(SRCDIR)/,desktop_monitor.py)
 VULKAN_LAYERS_TARGET := $(addprefix $(DST_BASE)/,vulkan_layers.py)
 $(VULKAN_LAYERS_TARGET): $(addprefix $(SRCDIR)/,vulkan_layers.py)
 
+MESA_TARGET := $(addprefix $(DST_BASE)/,mesa.py)
+$(MESA_TARGET): $(addprefix $(SRCDIR)/,mesa.py)
+
 PROTON_PY_TARGET := $(addprefix $(DST_BASE)/,proton)
 $(PROTON_PY_TARGET): $(addprefix $(SRCDIR)/,proton)
 
@@ -2048,7 +2051,7 @@ USER_SETTINGS_PY_TARGET := $(addprefix $(DST_BASE)/,user_settings.sample.py)
 $(USER_SETTINGS_PY_TARGET): $(addprefix $(SRCDIR)/,user_settings.sample.py)
 
 DIST_COPY_TARGETS := $(FILELOCK_TARGET) $(PROTON_PY_TARGET) \
-                     $(VULKAN_BINDINGS_TARGET) $(UTILITIES_TARGET) $(DESKTOP_MONITOR_TARGET) $(VULKAN_LAYERS_TARGET) \
+                     $(VULKAN_BINDINGS_TARGET) $(UTILITIES_TARGET) $(DESKTOP_MONITOR_TARGET) $(VULKAN_LAYERS_TARGET) $(MESA_TARGET) \
                      $(PROTON37_TRACKED_FILES_TARGET) $(USER_SETTINGS_PY_TARGET)
 
 ifeq ($(ENABLE_WOW64),1)

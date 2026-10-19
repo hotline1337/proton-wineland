@@ -114,6 +114,21 @@ default by setting `PROTON_ENABLE_WAYLAND=1`, so games and supporting
 applications run through Wayland automatically.
 
 
+How do I use the bundled RADV driver?
+----------------------------------------
+
+For AMD Vulkan games, set this launch option:
+
+```sh
+PROTON_RADV_DEVELOPMENT=1 %command%
+```
+
+This uses the bundled `radv-salkim` driver for that launch without replacing
+your system driver. Available on x86-64 only.
+It is built from a snapshot of Mesa's development branch (`main`) and may
+be less stable than your system RADV driver.
+
+
 How are Vulkan overlays ordered?
 --------------------------------
 
