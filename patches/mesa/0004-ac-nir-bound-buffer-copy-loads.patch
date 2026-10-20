@@ -1,0 +1,144 @@
+diff --git a/src/amd/common/nir/ac_nir_meta_cs_clear_copy_buffer.c b/src/amd/common/nir/ac_nir_meta_cs_clear_copy_buffer.c
+--- a/src/amd/common/nir/ac_nir_meta_cs_clear_copy_buffer.c
++++ b/src/amd/common/nir/ac_nir_meta_cs_clear_copy_buffer.c
+@@ -74,6 +74,37 @@
+ }
+ 
+ static nir_def *
++load_buffer_partial(nir_builder *b, const ac_cs_clear_copy_buffer_key *const key,
++                    unsigned num_components, unsigned bit_size, nir_def *buf, nir_def *offset,
++                    unsigned first_component, unsigned end_component, unsigned align_offset)
++{
++   nir_def *components[NIR_MAX_VEC_COMPONENTS];
++
++   assert(first_component < end_component && end_component <= num_components);
++   assert(nir_num_components_valid(num_components));
++
++   for (unsigned i = 0; i < num_components; i++)
++      components[i] = nir_undef(b, 1, bit_size);
++
++   for (unsigned i = first_component; i < end_component;) {
++      unsigned count = end_component - i;
++      while (!nir_num_components_valid(count))
++         count--;
++
++      const unsigned byte_offset = i * bit_size / 8;
++      nir_def *loaded = load_buffer_sparse(b, key, count, bit_size, buf,
++                                           nir_iadd_imm(b, offset, byte_offset), ACCESS_RESTRICT,
++                                           4, (align_offset + byte_offset) % 4,
++                                           key->src_scalarize_for_sparse);
++      for (unsigned j = 0; j < count; j++)
++         components[i + j] = nir_channel(b, loaded, j);
++      i += count;
++   }
++
++   return nir_vec(b, components, num_components);
++}
++
++static nir_def *
+ load_buffer_addr_from_user_data(nir_builder *b,
+                 nir_def *user_data, const unsigned user_data_index)
+ {
+@@ -216,8 +247,8 @@
+                            (unsigned)realign_offset % 2 == 0 ? 2 : 1;
+       unsigned bit_size = alignment * 8;
+       unsigned num_comps = key->dwords_per_thread * 4 / alignment;
+-      nir_if *if_first_thread = NULL;
+-      nir_def *value0 = NULL;
++      unsigned last_thread_comps = key->dst_last_thread_bytes ?
++                                     DIV_ROUND_UP(key->dst_last_thread_bytes, alignment) : num_comps;
+       nir_def *src_buf;
+ 
+       if (key->addr_user_data)
+@@ -225,45 +256,55 @@
+       else
+          src_buf = nir_imm_int(&b, 0);
+ 
+-      if (realign_offset < 0) {
+-         /* if src_align_offset is less than dst_align_offset, realign_offset is
+-          * negative, which causes the first thread to use a negative buffer offset, which goes
+-          * entirely out of bounds because the offset is treated as unsigned. Instead of that,
+-          * the first thread should load from offset 0 by not loading the bytes before
+-          * the beginning of the buffer.
+-          */
+-         if_first_thread = nir_push_if(&b, nir_ieq_imm(&b, thread_id, 0));
+-         {
+-            unsigned num_removed_comps = -realign_offset / alignment;
+-            unsigned num_inbounds_comps = num_comps - num_removed_comps;
+-
+-            /* Only 8 and 16 component vectors are valid after 5 in NIR. */
+-            while (!nir_num_components_valid(num_inbounds_comps))
+-               num_inbounds_comps = util_next_power_of_two(num_inbounds_comps);
+-
+-            value0 = load_buffer_sparse(&b, key, num_inbounds_comps, bit_size, src_buf, offset,
+-                                        ACCESS_RESTRICT, 4, 0, key->src_scalarize_for_sparse);
+-
+-            /* Add the components that we didn't load as undef. */
+-            nir_def *comps[16];
+-            assert(num_comps <= ARRAY_SIZE(comps));
+-            for (unsigned i = 0; i < num_comps; i++) {
+-               if (i < num_removed_comps)
+-                  comps[i] = nir_undef(&b, 1, bit_size);
+-               else
+-                  comps[i] = nir_channel(&b, value0, i - num_removed_comps);
+-            }
+-            value0 = nir_vec(&b, comps, num_comps);
++      nir_def *load_offset = nir_iadd_imm(&b, offset, realign_offset);
++      unsigned first_thread_component = realign_offset < 0 ? -realign_offset / alignment : 0;
++
++      if (key->addr_user_data && key->dst_single_thread_unaligned) {
++         value = load_buffer_partial(&b, key, num_comps, bit_size, src_buf, load_offset,
++                                     first_thread_component, last_thread_comps,
++                                     (unsigned)realign_offset % 4);
++      } else {
++         nir_if *if_last_thread = NULL;
++         nir_def *value_last = NULL;
++
++         if (key->addr_user_data && last_thread_comps < num_comps) {
++            nir_def *last_thread_id = nir_channel(&b, user_data, last_thread_user_data_index);
++            if_last_thread = nir_push_if(&b, nir_ieq(&b, thread_id, last_thread_id));
++            value_last = load_buffer_partial(&b, key, num_comps, bit_size, src_buf, load_offset,
++                                             0, last_thread_comps, (unsigned)realign_offset % 4);
++            nir_push_else(&b, if_last_thread);
+          }
+-         nir_push_else(&b, if_first_thread);
+-      }
+ 
+-      value = load_buffer_sparse(&b, key, num_comps, bit_size, src_buf, nir_iadd_imm(&b, offset, realign_offset),
+-                                 ACCESS_RESTRICT, 4, (unsigned)realign_offset % 4, key->src_scalarize_for_sparse);
++         nir_if *if_first_thread = NULL;
++         nir_def *value0 = NULL;
++
++         if (realign_offset < 0) {
++            /* if src_align_offset is less than dst_align_offset, realign_offset is
++             * negative, which causes the first thread to use a negative buffer offset, which goes
++             * entirely out of bounds because the offset is treated as unsigned. Instead of that,
++             * the first thread should load from offset 0 by not loading the bytes before
++             * the beginning of the buffer.
++             */
++            if_first_thread = nir_push_if(&b, nir_ieq_imm(&b, thread_id, 0));
++            value0 = load_buffer_partial(&b, key, num_comps, bit_size, src_buf, load_offset,
++                                         first_thread_component, num_comps,
++                                         (unsigned)realign_offset % 4);
++            nir_push_else(&b, if_first_thread);
++         }
++
++         value = load_buffer_sparse(&b, key, num_comps, bit_size, src_buf, load_offset,
++                                     ACCESS_RESTRICT, 4, (unsigned)realign_offset % 4,
++                                     key->src_scalarize_for_sparse);
++
++         if (if_first_thread) {
++            nir_pop_if(&b, if_first_thread);
++            value = nir_if_phi(&b, value0, value);
++         }
+ 
+-      if (if_first_thread) {
+-         nir_pop_if(&b, if_first_thread);
+-         value = nir_if_phi(&b, value0, value);
++         if (if_last_thread) {
++            nir_pop_if(&b, if_last_thread);
++            value = nir_if_phi(&b, value_last, value);
++         }
+       }
+ 
+       /* Bitcast the vector to 32 bits. */
