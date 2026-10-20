@@ -23,7 +23,7 @@ VKD3D_LICENSE_PATHS := \
 	subprojects/dxil-spirv/subprojects/dxbc-spirv/submodules/spirv_headers/LICENSE
 
 GRAPHICS_LICENSE_FILES := \
-	$(foreach project,dxvk extras/dxvk-low-latency,$(addprefix $(project)/,$(DXVK_LICENSE_PATHS))) \
+	$(addprefix dxvk/,$(DXVK_LICENSE_PATHS)) \
 	$(foreach project,vkd3d-proton extras/vkd3d-low-latency,$(addprefix $(project)/,$(VKD3D_LICENSE_PATHS))) \
 	extras/dxvk-sarek/LICENSE \
 	extras/dxvk-sarek/include/openvr/LICENSE \
@@ -35,9 +35,8 @@ GRAPHICS_LICENSE_FILES := \
 # Recent Khronos headers split their notice and license texts. Older pinned
 # copies carry a self-contained LICENSE instead.
 GRAPHICS_LICENSE_FILES += $(patsubst $(SRCDIR)/%,%,$(wildcard \
-	$(foreach project,dxvk extras/dxvk-low-latency, \
-		$(SRCDIR)/$(project)/include/spirv/LICENSES/* \
-		$(SRCDIR)/$(project)/subprojects/dxbc-spirv/submodules/spirv_headers/LICENSES/*) \
+	$(SRCDIR)/dxvk/include/spirv/LICENSES/* \
+	$(SRCDIR)/dxvk/subprojects/dxbc-spirv/submodules/spirv_headers/LICENSES/* \
 	$(foreach project,vkd3d-proton extras/vkd3d-low-latency, \
 		$(SRCDIR)/$(project)/khronos/SPIRV-Headers/LICENSES/* \
 		$(SRCDIR)/$(project)/subprojects/dxil-spirv/third_party/spirv-headers/LICENSES/* \
