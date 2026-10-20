@@ -374,7 +374,7 @@ usage() {
   "$1" "                            Values: dxvk-sarek | d7vk | discord-rpc-bridge"
   "$1" ""
   "$1" "    --without-vklayers=<list> Comma-separated list of vulkan layers to disable, or 'all' to disable everything."
-  "$1" "                              Values: dxvk-nvapi-vkreflex-layer | low_latency_layer | pyroveil | vkbasalt"
+  "$1" "                              Values: dxvk-nvapi-vkreflex-layer | pyroveil | vkbasalt"
   "$1" ""
   "$1" "    --without-tts Disables text-to-speech libraries (OpenFST, VOSK, Kaldi and Piper)"
   "$1" ""
