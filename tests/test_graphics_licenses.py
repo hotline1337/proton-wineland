@@ -36,7 +36,6 @@ class GraphicsLicenseTests(unittest.TestCase):
                 "vkd3d-proton/subprojects/dxil-spirv/LICENSE.MIT",
                 "vkd3d-proton/subprojects/dxil-spirv/subprojects/dxbc-spirv/LICENSE",
                 "dxvk/subprojects/libdisplay-info/data/COPYING.hwdata",
-                "extras/vkd3d-low-latency/LICENSE",
                 "extras/dxvk-sarek/LICENSE",
             ):
                 self.assertTrue((installed / path).is_file(), path)

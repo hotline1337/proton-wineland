@@ -24,7 +24,7 @@ VKD3D_LICENSE_PATHS := \
 
 GRAPHICS_LICENSE_FILES := \
 	$(addprefix dxvk/,$(DXVK_LICENSE_PATHS)) \
-	$(foreach project,vkd3d-proton extras/vkd3d-low-latency,$(addprefix $(project)/,$(VKD3D_LICENSE_PATHS))) \
+	$(addprefix vkd3d-proton/,$(VKD3D_LICENSE_PATHS)) \
 	extras/dxvk-sarek/LICENSE \
 	extras/dxvk-sarek/include/openvr/LICENSE \
 	extras/dxvk-sarek/include/spirv/LICENSE \
@@ -37,10 +37,9 @@ GRAPHICS_LICENSE_FILES := \
 GRAPHICS_LICENSE_FILES += $(patsubst $(SRCDIR)/%,%,$(wildcard \
 	$(SRCDIR)/dxvk/include/spirv/LICENSES/* \
 	$(SRCDIR)/dxvk/subprojects/dxbc-spirv/submodules/spirv_headers/LICENSES/* \
-	$(foreach project,vkd3d-proton extras/vkd3d-low-latency, \
-		$(SRCDIR)/$(project)/khronos/SPIRV-Headers/LICENSES/* \
-		$(SRCDIR)/$(project)/subprojects/dxil-spirv/third_party/spirv-headers/LICENSES/* \
-		$(SRCDIR)/$(project)/subprojects/dxil-spirv/subprojects/dxbc-spirv/submodules/spirv_headers/LICENSES/*)))
+	$(SRCDIR)/vkd3d-proton/khronos/SPIRV-Headers/LICENSES/* \
+	$(SRCDIR)/vkd3d-proton/subprojects/dxil-spirv/third_party/spirv-headers/LICENSES/* \
+	$(SRCDIR)/vkd3d-proton/subprojects/dxil-spirv/subprojects/dxbc-spirv/submodules/spirv_headers/LICENSES/*))
 
 DIST_GRAPHICS_LICENSES := $(addprefix $(DST_BASE)/licenses/,$(GRAPHICS_LICENSE_FILES))
 
