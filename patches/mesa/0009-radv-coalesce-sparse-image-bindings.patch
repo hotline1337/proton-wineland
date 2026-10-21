@@ -1,0 +1,131 @@
+diff --git a/src/amd/vulkan/radv_queue.c b/src/amd/vulkan/radv_queue.c
+index 80cfc668ebb..cc716099561 100644
+--- a/src/amd/vulkan/radv_queue.c
++++ b/src/amd/vulkan/radv_queue.c
+@@ -83,25 +83,53 @@ radv_sparse_buffer_bind_memory(struct radv_device *device, const VkSparseBufferM
+    return result;
+ }
+ 
++static VkResult
++radv_sparse_image_bind_flush(struct radv_device *device, struct radv_image *image, VkSparseMemoryBind *pending)
++{
++   if (!pending->size)
++      return VK_SUCCESS;
++
++   VK_FROM_HANDLE(radv_device_memory, mem, pending->memory);
++   VkResult result = radv_bo_virtual_bind(device, &image->vk.base, image->bindings[0].bo, pending->resourceOffset,
++                                          pending->size, mem ? mem->bo : NULL, pending->memoryOffset);
++   if (result == VK_SUCCESS)
++      pending->size = 0;
++   return result;
++}
++
++static VkResult
++radv_sparse_image_bind_range(struct radv_device *device, struct radv_image *image, VkSparseMemoryBind *pending,
++                             const VkSparseMemoryBind *bind)
++{
++   if (pending->size && pending->memory == bind->memory && pending->flags == bind->flags &&
++       pending->resourceOffset + pending->size == bind->resourceOffset &&
++       (!bind->memory || pending->memoryOffset + pending->size == bind->memoryOffset)) {
++      pending->size += bind->size;
++      return VK_SUCCESS;
++   }
++
++   VkResult result = radv_sparse_image_bind_flush(device, image, pending);
++   if (result != VK_SUCCESS)
++      return result;
++
++   *pending = *bind;
++   return VK_SUCCESS;
++}
++
+ static VkResult
+ radv_sparse_image_opaque_bind_memory(struct radv_device *device, const VkSparseImageOpaqueMemoryBindInfo *bind)
+ {
+    VK_FROM_HANDLE(radv_image, image, bind->image);
++   VkSparseMemoryBind pending = {0};
+    VkResult result;
+ 
+    for (uint32_t i = 0; i < bind->bindCount; ++i) {
+-      struct radv_device_memory *mem = NULL;
+-
+-      if (bind->pBinds[i].memory != VK_NULL_HANDLE)
+-         mem = radv_device_memory_from_handle(bind->pBinds[i].memory);
+-
+-      result = radv_bo_virtual_bind(device, &image->vk.base, image->bindings[0].bo, bind->pBinds[i].resourceOffset,
+-                                    bind->pBinds[i].size, mem ? mem->bo : NULL, bind->pBinds[i].memoryOffset);
++      result = radv_sparse_image_bind_range(device, image, &pending, &bind->pBinds[i]);
+       if (result != VK_SUCCESS)
+          return result;
+    }
+ 
+-   return VK_SUCCESS;
++   return radv_sparse_image_bind_flush(device, image, &pending);
+ }
+ 
+ static VkResult
+@@ -111,10 +139,14 @@ radv_sparse_image_bind_memory(struct radv_device *device, const VkSparseImageMem
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+    const struct radeon_surf *surface = &image->planes[0].surface;
+    uint32_t bs = vk_format_get_blocksize(image->vk.format);
++   VkSparseMemoryBind pending = {0};
+    VkResult result;
+ 
+    for (uint32_t i = 0; i < bind->bindCount; ++i) {
+-      struct radv_device_memory *mem = NULL;
++      VkSparseMemoryBind range = {
++         .memory = bind->pBinds[i].memory,
++         .flags = bind->pBinds[i].flags,
++      };
+       uint64_t offset, depth_pitch;
+       uint32_t pitch;
+       uint64_t mem_offset = bind->pBinds[i].memoryOffset;
+@@ -129,9 +161,6 @@ radv_sparse_image_bind_memory(struct radv_device *device, const VkSparseImageMem
+       bind_offset.x /= vk_format_get_blockwidth(image->vk.format);
+       bind_offset.y /= vk_format_get_blockheight(image->vk.format);
+ 
+-      if (bind->pBinds[i].memory != VK_NULL_HANDLE)
+-         mem = radv_device_memory_from_handle(bind->pBinds[i].memory);
+-
+       if (pdev->info.gfx_level >= GFX9) {
+          offset = surface->u.gfx9.surf_slice_size * layer + surface->u.gfx9.prt_level_offset[level];
+          pitch = surface->u.gfx9.prt_level_pitch[level];
+@@ -156,9 +185,10 @@ radv_sparse_image_bind_memory(struct radv_device *device, const VkSparseImageMem
+                            (uint64_t)aligned_extent_width * aligned_extent_height * bs == depth_pitch);
+ 
+       if (whole_subres) {
+-         uint64_t size = (uint64_t)aligned_extent_width * aligned_extent_height * aligned_extent_depth * bs;
+-         result = radv_bo_virtual_bind(device, &image->vk.base, image->bindings[0].bo, offset, size,
+-                                       mem ? mem->bo : NULL, mem_offset);
++         range.resourceOffset = offset;
++         range.size = (uint64_t)aligned_extent_width * aligned_extent_height * aligned_extent_depth * bs;
++         range.memoryOffset = mem_offset;
++         result = radv_sparse_image_bind_range(device, image, &pending, &range);
+          if (result != VK_SUCCESS)
+             return result;
+       } else {
+@@ -169,11 +199,10 @@ radv_sparse_image_bind_memory(struct radv_device *device, const VkSparseImageMem
+          for (unsigned z = 0; z < bind_extent.depth;
+               z += surface->prt_tile_depth, offset += depth_pitch * surface->prt_tile_depth) {
+             for (unsigned y = 0; y < bind_extent.height; y += surface->prt_tile_height) {
+-               uint64_t bo_offset = offset + (uint64_t)img_y_increment * y;
+-
+-               result = radv_bo_virtual_bind(device, &image->vk.base, image->bindings[0].bo, bo_offset, size,
+-                                             mem ? mem->bo : NULL,
+-                                             mem_offset + (uint64_t)mem_y_increment * y + mem_z_increment * z);
++               range.resourceOffset = offset + (uint64_t)img_y_increment * y;
++               range.size = size;
++               range.memoryOffset = mem_offset + (uint64_t)mem_y_increment * y + mem_z_increment * z;
++               result = radv_sparse_image_bind_range(device, image, &pending, &range);
+                if (result != VK_SUCCESS)
+                   return result;
+             }
+@@ -181,7 +210,7 @@ radv_sparse_image_bind_memory(struct radv_device *device, const VkSparseImageMem
+       }
+    }
+ 
+-   return VK_SUCCESS;
++   return radv_sparse_image_bind_flush(device, image, &pending);
+ }
+ 
+ static VkResult
