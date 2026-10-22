@@ -1,0 +1,194 @@
+diff --git a/include/drm-uapi/amdgpu_drm.h b/include/drm-uapi/amdgpu_drm.h
+index f7c2f458122..994535cc7bd 100644
+--- a/include/drm-uapi/amdgpu_drm.h
++++ b/include/drm-uapi/amdgpu_drm.h
+@@ -73,11 +73,13 @@ extern "C" {
+ #define AMDGPU_INFO_GEM_VA_BATCH		0x53414c42
+ #define AMDGPU_GEM_VA_BATCH_COOKIE	0x53414c4b56414201ULL
+ #define AMDGPU_GEM_VA_BATCH_MAX_OPS	4096
++#define AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE	(1U << 0)
+ 
+ struct drm_amdgpu_info_gem_va_batch {
+ 	__u64 cookie;
+ 	__u32 max_ops;
+ 	__u32 reserved;
++	__u64 features;
+ };
+ 
+ struct drm_amdgpu_gem_va_batch_op {
+diff --git a/src/amd/vulkan/radv_queue.c b/src/amd/vulkan/radv_queue.c
+index 17b16ce8500..fd7633dcc02 100644
+--- a/src/amd/vulkan/radv_queue.c
++++ b/src/amd/vulkan/radv_queue.c
+@@ -243,12 +243,19 @@ radv_queue_bind_sparse_memory(struct radv_device *device, struct vk_queue_submit
+ }
+ 
+ static VkResult
+-radv_queue_submit_bind_sparse_memory(struct radv_device *device, struct vk_queue_submit *submission)
++radv_queue_submit_bind_sparse_memory(struct radv_device *device, struct vk_queue_submit *submission, bool wait_complete)
+ {
+-   if (!submission->buffer_bind_count && !submission->image_opaque_bind_count && !submission->image_bind_count)
++   if (!vk_queue_submit_has_bind(submission))
+       return VK_SUCCESS;
+ 
+-   struct radv_sparse_bind_state state = {.count_only = true};
++   if (wait_complete) {
++      VkResult result = vk_sync_wait_many(&device->vk, submission->wait_count, submission->waits,
++                                         VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
++   struct radv_sparse_bind_state state = {.count_only = true, .wait_complete = wait_complete};
+    _mesa_hash_table_init_u32_keys(&state.remaining, NULL);
+ 
+    VkResult result = radv_queue_bind_sparse_memory(device, submission, &state);
+@@ -1925,16 +1932,19 @@ radv_queue_sparse_submit(struct vk_queue *vqueue, struct vk_queue_submit *submis
+    struct radv_device *device = radv_queue_device(queue);
+    VkResult result;
+ 
+-   result = radv_queue_submit_bind_sparse_memory(device, submission);
++   bool wait_complete = vqueue->sparse_bind_wait_complete && vk_queue_submit_has_bind(submission);
++   result = radv_queue_submit_bind_sparse_memory(device, submission, wait_complete);
+    if (result != VK_SUCCESS)
+       goto fail;
+ 
+    /* We do a CPU wait here, in part to avoid more winsys mechanisms. In the likely kernel explicit
+     * sync mechanism, we'd need to do a CPU wait anyway. Haven't seen this be a perf issue yet, but
+     * we have to make sure the queue always has its submission thread enabled. */
+-   result = vk_sync_wait_many(&device->vk, submission->wait_count, submission->waits, 0, UINT64_MAX);
+-   if (result != VK_SUCCESS)
+-      goto fail;
++   if (!wait_complete) {
++      result = vk_sync_wait_many(&device->vk, submission->wait_count, submission->waits, 0, UINT64_MAX);
++      if (result != VK_SUCCESS)
++         goto fail;
++   }
+ 
+    /* Ignore all the commandbuffers. They're necessarily empty anyway. */
+ 
+@@ -1964,7 +1974,7 @@ radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
+    struct radv_queue *queue = (struct radv_queue *)vqueue;
+    struct radv_device *device = radv_queue_device(queue);
+ 
+-   VkResult result = radv_queue_submit_bind_sparse_memory(device, submission);
++   VkResult result = radv_queue_submit_bind_sparse_memory(device, submission, vqueue->sparse_bind_wait_complete);
+    if (result != VK_SUCCESS)
+       goto fail;
+ 
+@@ -2029,6 +2039,9 @@ radv_queue_init(struct radv_device *device, struct radv_queue *queue, int idx,
+    if (result != VK_SUCCESS)
+       return result;
+ 
++   queue->vk.sparse_bind_wait_complete = device->ws->sparse_bind_wait_complete &&
++                                        vk_device_supports_threaded_submit(&device->vk);
++
+    queue->state.uses_shadow_regs = device->uses_shadow_regs && queue->state.qf == RADV_QUEUE_GENERAL;
+    if (queue->state.uses_shadow_regs) {
+       result = radv_create_shadow_regs_preamble(device, &queue->state);
+diff --git a/src/amd/vulkan/radv_radeon_winsys.h b/src/amd/vulkan/radv_radeon_winsys.h
+index a3819468deb..71662d0dbd1 100644
+--- a/src/amd/vulkan/radv_radeon_winsys.h
++++ b/src/amd/vulkan/radv_radeon_winsys.h
+@@ -166,6 +166,7 @@ struct radv_sparse_bind_state {
+    struct hash_table remaining;
+    bool count_only;
+    bool report_only;
++   bool wait_complete;
+    struct drm_amdgpu_gem_va_batch_op *ops;
+    uint32_t op_count;
+    uint32_t op_capacity;
+@@ -273,6 +274,8 @@ struct radeon_winsys {
+ 
+    VkResult (*buffer_bind_batch)(struct radeon_winsys *ws, const struct radv_sparse_bind_state *state);
+ 
++   bool sparse_bind_wait_complete;
++
+    VkResult (*buffer_make_resident)(struct radeon_winsys *ws, struct radeon_winsys_bo *bo, bool resident);
+ 
+    VkResult (*ctx_create)(struct radeon_winsys *ws, enum radeon_ctx_priority priority, struct radeon_winsys_ctx **ctx);
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+index cbfea3b2c79..f5eba953145 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+@@ -146,24 +146,44 @@ static bool
+ radv_amdgpu_has_va_batch(struct radv_amdgpu_winsys *ws)
+ {
+    struct drm_amdgpu_info_gem_va_batch caps = {0};
+-   return !ws->info.is_virtio &&
+-          !ac_drm_query_info(ws->dev, AMDGPU_INFO_GEM_VA_BATCH, sizeof(caps), &caps) &&
+-          caps.cookie == AMDGPU_GEM_VA_BATCH_COOKIE && caps.max_ops == AMDGPU_GEM_VA_BATCH_MAX_OPS &&
+-          !caps.reserved;
++   ws->base.sparse_bind_wait_complete = false;
++   if (ws->info.is_virtio || ac_drm_query_info(ws->dev, AMDGPU_INFO_GEM_VA_BATCH, sizeof(caps), &caps) ||
++       caps.cookie != AMDGPU_GEM_VA_BATCH_COOKIE || caps.max_ops != AMDGPU_GEM_VA_BATCH_MAX_OPS || caps.reserved)
++      return false;
++
++   ws->base.sparse_bind_wait_complete = !ws->info.userq_ip_mask &&
++                                      (caps.features & AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE);
++   return true;
+ }
+ 
+ static VkResult
+ radv_amdgpu_winsys_bind_batch(struct radeon_winsys *_ws, const struct radv_sparse_bind_state *state)
+ {
+    struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
++   uint32_t flags = state->wait_complete ? AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE : 0;
+ 
+    for (uint32_t i = 0; i < state->op_count;) {
+       struct drm_amdgpu_gem_va_batch batch = {
+          .cookie = AMDGPU_GEM_VA_BATCH_COOKIE,
+          .operations = (uintptr_t)(state->ops + i),
+          .count = MIN2(state->op_count - i, AMDGPU_GEM_VA_BATCH_MAX_OPS),
++         .flags = flags,
+       };
+       int r = drm_ioctl_write_read(ws->fd, DRM_AMDGPU_GEM_VA_BATCH, &batch, sizeof(batch));
++      if (r == -EOPNOTSUPP && !batch.applied && !batch.status && flags) {
++         batch.flags = flags = 0;
++         r = drm_ioctl_write_read(ws->fd, DRM_AMDGPU_GEM_VA_BATCH, &batch, sizeof(batch));
++      }
++      if (r == -EOPNOTSUPP && !batch.applied && !batch.status) {
++         for (; i < state->op_count; ++i) {
++            const struct drm_amdgpu_gem_va_batch_op *op = &state->ops[i];
++            r = ac_drm_bo_va_op_raw(ws->dev, op->handle, op->offset_in_bo, op->map_size, op->va_address,
++                                   op->flags, AMDGPU_VA_OP_REPLACE);
++            if (r)
++               return VK_ERROR_DEVICE_LOST;
++         }
++         return VK_SUCCESS;
++      }
+       if (r || batch.status || batch.applied != batch.count)
+          return VK_ERROR_DEVICE_LOST;
+       i += batch.count;
+diff --git a/src/vulkan/runtime/vk_queue.c b/src/vulkan/runtime/vk_queue.c
+index 78439dbbefb..c4919e780df 100644
+--- a/src/vulkan/runtime/vk_queue.c
++++ b/src/vulkan/runtime/vk_queue.c
+@@ -1067,9 +1067,13 @@ vk_queue_submit(struct vk_queue *queue,
+        queue->submit.mode != VK_QUEUE_SUBMIT_MODE_THREADED) {
+       assert(queue->submit.mode == VK_QUEUE_SUBMIT_MODE_IMMEDIATE);
+ 
++      enum vk_sync_wait_flags wait_flags = VK_SYNC_WAIT_PENDING;
++      if (queue->sparse_bind_wait_complete && vk_queue_submit_has_bind(submit))
++         wait_flags = VK_SYNC_WAIT_COMPLETE;
++
+       result = vk_sync_wait_many(queue->base.device,
+                                  submit->wait_count, submit->waits,
+-                                 VK_SYNC_WAIT_PENDING, 0);
++                                 wait_flags, 0);
+       if (result == VK_TIMEOUT)
+          result = vk_queue_enable_submit_thread(queue);
+       if (unlikely(result != VK_SUCCESS))
+diff --git a/src/vulkan/runtime/vk_queue.h b/src/vulkan/runtime/vk_queue.h
+index 82b8d1401f0..3eabddba775 100644
+--- a/src/vulkan/runtime/vk_queue.h
++++ b/src/vulkan/runtime/vk_queue.h
+@@ -71,6 +71,8 @@ struct vk_queue {
+    VkResult (*driver_submit)(struct vk_queue *queue,
+                              struct vk_queue_submit *submit);
+ 
++   bool sparse_bind_wait_complete;
++
+    struct {
+       /** Current submit mode
+        *
