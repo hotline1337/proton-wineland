@@ -18,7 +18,7 @@ class SteamClientPathTests(unittest.TestCase):
             directory = Path(temporary)
             source = directory / "test.cpp"
             binary = directory / "test"
-            source.write_text(harness.replace("ACTUAL_HELPER", helper))
+            source.write_text(harness.replace("ACTUAL_HELPER", helper).replace("TEST_DIRECTORY", str(directory)))
             command = shlex.split(os.environ.get("CXX", "c++"))
             command += ["-std=c++11", "-Wall", "-Wextra", "-Werror", "-g"]
             if os.environ.get("STEAMCLIENT_PATH_SANITIZERS"):
@@ -81,6 +81,140 @@ int main()
         assert(free_count == (mode == 3));
         free(result);
     }
+}
+""")
+
+    def test_install_directory_boundaries(self):
+        source = SOURCE.read_text()
+        helper = source[source.index("char *steamclient_dos_to_unix_path_fixup_slash("):
+                        source.index("void steamclient_free_path(")]
+        self.run_native(helper, r"""
+#include <cassert>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <sys/stat.h>
+#include <unistd.h>
+#define TRACE(...) ((void)0)
+
+static bool fail_conversion, fail_resolution;
+static char *steamclient_dos_to_unix_path(const char *src, int)
+{
+    return src && !fail_conversion ? strdup(src) : nullptr;
+}
+static char *resolve_path(const char *src, char *dst)
+{
+    return fail_resolution ? nullptr : realpath(src, dst);
+}
+#define realpath resolve_path
+ACTUAL_HELPER
+#undef realpath
+
+static void check(const std::string &src, const std::string &expected)
+{
+    char *path = steamclient_dos_to_unix_path_fixup_slash(src.c_str(), 0);
+    assert(path && !strcmp(path, expected.c_str()));
+    free(path);
+}
+int main()
+{
+    const std::string base = "TEST_DIRECTORY/game", alias = "TEST_DIRECTORY/alias";
+    assert(!mkdir(base.c_str(), 0700));
+    assert(!symlink(base.c_str(), alias.c_str()));
+    assert(!setenv("STEAM_COMPAT_INSTALL_PATH", base.c_str(), 1));
+    check("/", "/");
+    check("", "");
+    check(base, base);
+    check(base + "/nested/data/file", base + "/nested\\data\\file");
+    check(base + "-other/data/file", base + "-other/data/file");
+    check("relative/data/file", "relative/data/file");
+    check("file://" + base + "/nested/file", "file://" + base + "/nested/file");
+    assert(!steamclient_dos_to_unix_path_fixup_slash(nullptr, 0));
+    assert(!setenv("STEAM_COMPAT_INSTALL_PATH", alias.c_str(), 1));
+    check(base + "/nested/file", base + "/nested\\file");
+    assert(!setenv("STEAM_COMPAT_INSTALL_PATH", "/", 1));
+    check("/elsewhere/data/file", "/elsewhere\\data\\file");
+    check("/", "/");
+    fail_resolution = true;
+    check(base + "/nested/file", base + "/nested/file");
+    fail_resolution = false;
+    fail_conversion = true;
+    assert(!steamclient_dos_to_unix_path_fixup_slash(base.c_str(), 0));
+    fail_conversion = false;
+    assert(!setenv("STEAM_COMPAT_INSTALL_PATH", "/missing-install-directory", 1));
+    check(base + "/nested/file", base + "/nested/file");
+    assert(!unsetenv("STEAM_COMPAT_INSTALL_PATH"));
+    check(base + "/nested/file", base + "/nested/file");
+}
+""")
+
+    def test_canonical_paths(self):
+        source = SOURCE.read_text()
+        helper = source[source.index("char *steamclient_dos_to_unix_path("):
+                        source.index("char *steamclient_dos_to_unix_path_fixup_slash(")]
+        self.run_native(helper, r"""
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits.h>
+#include <string>
+#include <sys/stat.h>
+#include <unistd.h>
+using WCHAR = char16_t;
+#define TRACE(...) ((void)0)
+#define ERR(...) ((void)0)
+#define IS_ABSOLUTE(x) (*(x) == '/' || *(x) == '\\' || (*(x) && *((x) + 1) == ':'))
+static const char *converted_path;
+static bool fail_resolution;
+static uint32_t ntdll_umbstowcs(const char *src, int length, WCHAR *dst, int capacity)
+{
+    assert(length < capacity);
+    for (int i = 0; i < length; ++i) dst[i] = src[i];
+    return length;
+}
+static void collapse_path(WCHAR *, unsigned int) {}
+static void url_unescape(WCHAR *) {}
+static char *get_unix_file_name(WCHAR *) { return strdup(converted_path); }
+static void lstrcpynA(char *dst, const char *src, size_t size)
+{
+    snprintf(dst, size, "%s", src);
+}
+static char *resolve_path(const char *src, char *dst)
+{
+    return fail_resolution ? nullptr : realpath(src, dst);
+}
+#define realpath resolve_path
+ACTUAL_HELPER
+#undef realpath
+static void check(const char *src, int url, const std::string &expected)
+{
+    char *path = steamclient_dos_to_unix_path(src, url);
+    assert(path && !strcmp(path, expected.c_str()));
+    free(path);
+}
+int main()
+{
+    const std::string base = "TEST_DIRECTORY/game", alias = "TEST_DIRECTORY/alias";
+    assert(!mkdir(base.c_str(), 0700));
+    assert(!symlink(base.c_str(), alias.c_str()));
+    FILE *file = fopen((base + "/data").c_str(), "w");
+    assert(file && !fclose(file));
+    std::string converted = alias + "/data";
+    converted_path = converted.c_str();
+    check("Z:\\alias\\data", 0, base + "/data");
+    check("file://Z:/alias/data", 1, "file://" + alias + "/data");
+    check("https://example.test/data", 1, "https://example.test/data");
+    check("relative\\data", 0, "relative/data");
+    check("", 0, "");
+    fail_resolution = true;
+    check("Z:\\alias\\data", 0, converted);
+    fail_resolution = false;
+    converted = alias + "/missing";
+    converted_path = converted.c_str();
+    check("Z:\\alias\\missing", 0, converted);
+    assert(!steamclient_dos_to_unix_path(nullptr, 0));
 }
 """)
 

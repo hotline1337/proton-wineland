@@ -1148,7 +1148,8 @@ char *steamclient_dos_to_unix_path_fixup_slash( const char *src, int is_url )
     if (!(install_dir_env = getenv( "STEAM_COMPAT_INSTALL_PATH" ))) return path;
     if (!(install_path = realpath( install_dir_env, NULL ))) return path;
     len = strlen( install_path );
-    if (!memcmp( path, install_path, len ))
+    if (!strncmp( path, install_path, len ) &&
+            (path[len] == '/' || (len == 1 && install_path[0] == '/')))
     {
         p = path + len;
         if (*p == '/') ++p;
