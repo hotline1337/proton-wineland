@@ -1,4 +1,4 @@
-# RADV is private to Proton and selected only by PROTON_RADV_DEVELOPMENT=1.
+# RADV is private to Proton and selected only by PROTON_RADV=1.
 MESA_ARCHS := $(filter i386 x86_64,$(unix_ARCHS))
 MESA_PATCHES := $(sort $(wildcard $(SRC)/patches/mesa/*.patch))
 MESA_DEPENDS := wayland-protocols

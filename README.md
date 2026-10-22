@@ -120,7 +120,7 @@ How do I use the bundled RADV driver?
 For AMD Vulkan games, set this launch option:
 
 ```sh
-PROTON_RADV_DEVELOPMENT=1 %command%
+PROTON_RADV=1 %command%
 ```
 
 This uses the bundled `radv-salkim` driver for that launch without replacing

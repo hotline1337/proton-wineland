@@ -22,7 +22,7 @@ class MesaTests(unittest.TestCase):
         self.files = self.root / "files"
         self.host = self.root / "host"
         self.runtime = self.root / "pressure-vessel/vulkan/icd.d"
-        self.env = {"PROTON_RADV_DEVELOPMENT": "1", "HOME": str(self.root / "home"),
+        self.env = {"PROTON_RADV": "1", "HOME": str(self.root / "home"),
                     "XDG_CONFIG_DIRS": str(self.root / "config"),
                     "XDG_DATA_DIRS": str(self.host)}
         self.log = mock.Mock()
@@ -85,9 +85,9 @@ class MesaTests(unittest.TestCase):
         for value in (None, "", "0", "true", "yes"):
             with self.subTest(value=value):
                 if value is None:
-                    self.env.pop("PROTON_RADV_DEVELOPMENT", None)
+                    self.env.pop("PROTON_RADV", None)
                 else:
-                    self.env["PROTON_RADV_DEVELOPMENT"] = value
+                    self.env["PROTON_RADV"] = value
                 before = dict(self.env)
                 with mock.patch.object(mesa, "_bundle", side_effect=AssertionError):
                     self.assertFalse(self.configure())
@@ -334,6 +334,10 @@ class LauncherStartupTests(unittest.TestCase):
                                 and isinstance(value.func.value, ast.Name)
                                 and value.func.value.id == "mesa"
                                 and value.func.attr == "configure" for value in ast.walk(node)))
+        condition = compile(ast.Expression(selector.test), str(ROOT / "proton"), "eval")
+        for value in (None, "", "0", "1", "true"):
+            namespace = {"os": mock.Mock(environ={"PROTON_RADV": value})}
+            self.assertEqual(eval(condition, namespace), value == "1")
         imports = [node for node in tree.body if isinstance(node, ast.Import)
                    and any(alias.name in ("protonfixes", "utilities", "vulkan_layers")
                            for alias in node.names)]

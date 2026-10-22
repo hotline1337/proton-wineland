@@ -127,7 +127,7 @@ def configure(env, files_dir, log):
     applies to this interpreter and is inherited by all subsequently launched
     Wine processes. No global library search paths are changed.
     """
-    if env.get("PROTON_RADV_DEVELOPMENT") != "1":
+    if env.get("PROTON_RADV") != "1":
         return False
     if platform.machine() not in ("x86_64", "amd64"):
         log("Bundled RADV is only available on x86-64")

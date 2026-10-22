@@ -39,7 +39,7 @@ from filelock import FileLock
 from random import randrange
 
 # Select the private driver before any module loads Vulkan.
-if os.environ.get("PROTON_RADV_DEVELOPMENT") == "1":
+if os.environ.get("PROTON_RADV") == "1":
     import mesa
     mesa.configure(os.environ,
                    os.path.join(os.path.dirname(os.path.realpath(__file__)), "files"),
