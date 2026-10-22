@@ -1630,33 +1630,58 @@ XrResult WINAPI xrNegotiateLoaderRuntimeInterface(const XrNegotiateLoaderInfo *i
 XrResult WINAPI xrGetVulkanDeviceExtensionsKHR(XrInstance instance, XrSystemId systemId, uint32_t bufferCapacityInput, uint32_t *bufferCountOutput, char *buffer)
 {
     struct xrGetVulkanDeviceExtensionsKHR_params params;
-    char internal_exts[4096];
-    uint32_t size;
+    char *internal_exts = NULL, *tmp;
+    uint32_t size, capacity = 0;
+
+    if (!bufferCountOutput || (bufferCapacityInput && !buffer)) return XR_ERROR_VALIDATION_FAILURE;
 
     /* Even while returning fixed string still call the host function, that is a part of OpenXR over Vulkan
      * expected initialization sequence. */
     params.instance = instance;
     params.systemId = systemId;
-    params.bufferCapacityInput = bufferCapacityInput ? sizeof(internal_exts) : 0;
     params.bufferCountOutput = &size;
-    params.buffer = bufferCapacityInput ? internal_exts : NULL;
-    UNIX_CALL_CHECKED(xrGetVulkanDeviceExtensionsKHR, &params);
 
-    if (params.result)
+    for (;;)
     {
-      ERR("params.result %d, size %u.\n", params.result, size);
-      return params.result;
+        params.bufferCapacityInput = capacity;
+        params.buffer = internal_exts;
+        UNIX_CALL_CHECKED(xrGetVulkanDeviceExtensionsKHR, &params);
+        if (params.result != XR_SUCCESS && params.result != XR_ERROR_SIZE_INSUFFICIENT) break;
+
+        *bufferCountOutput = sizeof(WINE_VULKAN_DEVICE_EXTENSION_NAME);
+        if (bufferCapacityInput < *bufferCountOutput)
+        {
+            params.result = bufferCapacityInput ? XR_ERROR_SIZE_INSUFFICIENT : XR_SUCCESS;
+            break;
+        }
+        if (params.result == XR_SUCCESS && capacity)
+        {
+            if (strnlen(internal_exts, capacity) == capacity)
+            {
+                params.result = XR_ERROR_RUNTIME_FAILURE;
+                break;
+            }
+            __wine_set_unix_env(WINE_VULKAN_DEVICE_VARIABLE, internal_exts);
+            memcpy(buffer, WINE_VULKAN_DEVICE_EXTENSION_NAME, sizeof(WINE_VULKAN_DEVICE_EXTENSION_NAME));
+            TRACE("returning %s.\n", buffer);
+            break;
+        }
+        if (size <= capacity)
+        {
+            params.result = XR_ERROR_RUNTIME_FAILURE;
+            break;
+        }
+        if (!(tmp = realloc(internal_exts, size)))
+        {
+            params.result = XR_ERROR_OUT_OF_MEMORY;
+            break;
+        }
+        internal_exts = tmp;
+        capacity = size;
     }
 
-    *bufferCountOutput = sizeof(WINE_VULKAN_DEVICE_EXTENSION_NAME);
-
-    if (bufferCapacityInput < *bufferCountOutput)
-      return bufferCapacityInput ? XR_ERROR_SIZE_INSUFFICIENT : XR_SUCCESS;
-
-    __wine_set_unix_env(WINE_VULKAN_DEVICE_VARIABLE, internal_exts);
-    strcpy(buffer, WINE_VULKAN_DEVICE_EXTENSION_NAME);
-    TRACE("returning %s.\n", buffer);
-    return XR_SUCCESS;
+    free(internal_exts);
+    return params.result;
 }
 
 

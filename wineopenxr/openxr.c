@@ -341,8 +341,8 @@ XrResult WINAPI wine_xrGetVulkanInstanceExtensionsKHR(XrInstance instance,
   static const char win32_surface[] = "VK_KHR_surface VK_KHR_win32_surface";
 
   XrResult res;
-  char internal_exts[4096];
-  uint32_t size;
+  char *internal_exts = NULL, *tmp;
+  uint32_t size, capacity = 0;
 
   TRACE("%p, 0x%s, %u, %p, %p\n", (void *)(uintptr_t)instance, wine_dbgstr_longlong(systemId), bufferCapacityInput, bufferCountOutput,
         buffer);
@@ -351,27 +351,52 @@ XrResult WINAPI wine_xrGetVulkanInstanceExtensionsKHR(XrInstance instance,
    * return win32_surface. Some games (including hello_xr) depend on that, so
    * add it here. */
 
-  res = g_xr_host_instance_dispatch_table.p_xrGetVulkanInstanceExtensionsKHR(
-      wine_instance_from_handle(instance)->host_instance, systemId, sizeof(internal_exts),
-      &size, internal_exts);
+  if (!bufferCountOutput || (bufferCapacityInput && !buffer)) return XR_ERROR_VALIDATION_FAILURE;
 
-  if (res)
+  for (;;)
   {
-    ERR("params.result %d, size %u.\n", res, size);
-    return res;
+    res = g_xr_host_instance_dispatch_table.p_xrGetVulkanInstanceExtensionsKHR(
+        wine_instance_from_handle(instance)->host_instance, systemId, capacity, &size, internal_exts);
+    if (res == XR_SUCCESS && capacity) break;
+    if (res != XR_SUCCESS && res != XR_ERROR_SIZE_INSUFFICIENT) goto done;
+    if (size <= capacity)
+    {
+      res = XR_ERROR_RUNTIME_FAILURE;
+      goto done;
+    }
+    if (size > UINT32_MAX - sizeof(win32_surface) ||
+        !(tmp = realloc(internal_exts, (size_t)size + sizeof(win32_surface))))
+    {
+      res = XR_ERROR_OUT_OF_MEMORY;
+      goto done;
+    }
+    internal_exts = tmp;
+    capacity = size;
   }
 
-  size = strlen(internal_exts) + 1;
-  internal_exts[size - 1] = ' ';
-  memcpy(&internal_exts[size], win32_surface, sizeof(win32_surface));
-  size = strlen(internal_exts) + 1;
+  size = strnlen(internal_exts, capacity);
+  if (size == capacity)
+  {
+    res = XR_ERROR_RUNTIME_FAILURE;
+    goto done;
+  }
+  if (size) internal_exts[size++] = ' ';
+  memcpy(internal_exts + size, win32_surface, sizeof(win32_surface));
+  size += sizeof(win32_surface);
 
   *bufferCountOutput = size;
+  res = XR_SUCCESS;
   if (bufferCapacityInput < size)
-    return bufferCapacityInput ? XR_ERROR_SIZE_INSUFFICIENT : XR_SUCCESS;
-  memcpy(buffer, internal_exts, size);
-  TRACE("returning: %s\n", buffer);
-  return XR_SUCCESS;
+    res = bufferCapacityInput ? XR_ERROR_SIZE_INSUFFICIENT : XR_SUCCESS;
+  else
+  {
+    memcpy(buffer, internal_exts, size);
+    TRACE("returning: %s\n", buffer);
+  }
+
+done:
+  free(internal_exts);
+  return res;
 }
 
 static VkResult WINAPI vk_create_instance_callback(const VkInstanceCreateInfo *create_info,
