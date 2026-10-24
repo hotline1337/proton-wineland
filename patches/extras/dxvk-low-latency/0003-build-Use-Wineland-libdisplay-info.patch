@@ -1,0 +1,19 @@
+From: Erhan Bilgili <erhan.bilgili@gmail.com>
+Subject: [PATCH] [build] Use Wineland libdisplay-info
+
+Accept the 0.4.x EDID parser shared with regular DXVK. The Proton source
+staging rule supplies the same pinned Wineland fork, including HDMI Forum
+extension-count handling and Windows static-library support.
+
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -50,7 +50,7 @@ endif
+ 
+ dep_displayinfo = dependency(
+   'libdisplay-info',
+-  version: ['>= 0.0.0', '< 0.2.0'],
++  version: ['>= 0.4.0', '< 0.5.0'],
+   fallback: ['libdisplay-info', 'di_dep'],
+   default_options: ['default_library=static'],
+ )
