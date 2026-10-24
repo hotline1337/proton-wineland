@@ -1,4 +1,4 @@
-From 5941985d25247805a4129b194ee969def2186791 Mon Sep 17 00:00:00 2001
+From e73017757414b4c28799372c18732c259c4da97b Mon Sep 17 00:00:00 2001
 From: Erhan Bilgili <erhan.bilgili@gmail.com>
 Date: Sat, 26 Sep 2026 10:44:34 +0200
 Subject: [PATCH] radv: preserve upload state when allocation fails
@@ -8,60 +8,68 @@ the command stream. Keep the previous allocation intact and release
 the replacement when mapping or bookkeeping allocation fails.
 
 Stop buffer updates when uploading their source data fails.
+
+Generated-by: LLM
 ---
  src/amd/vulkan/meta/radv_meta_buffer.c |  3 ++-
- src/amd/vulkan/radv_cmd_buffer.c       | 17 ++++++++++-------
- 2 files changed, 12 insertions(+), 8 deletions(-)
+ src/amd/vulkan/radv_cmd_buffer.c       | 23 +++++++++++++----------
+ 2 files changed, 15 insertions(+), 11 deletions(-)
 
 diff --git a/src/amd/vulkan/meta/radv_meta_buffer.c b/src/amd/vulkan/meta/radv_meta_buffer.c
-index 3c3084f75b4..0b30863df95 100644
+index 65bc652e37d..652d14c4b37 100644
 --- a/src/amd/vulkan/meta/radv_meta_buffer.c
 +++ b/src/amd/vulkan/meta/radv_meta_buffer.c
 @@ -411,7 +411,8 @@ radv_update_memory(struct radv_cmd_buffer *cmd_buffer, uint64_t va, uint64_t siz
     } else {
-       uint32_t buf_offset;
+       uint64_t src_va;
  
--      radv_cmd_buffer_upload_data(cmd_buffer, size, data, &buf_offset);
-+      if (!radv_cmd_buffer_upload_data(cmd_buffer, size, data, &buf_offset))
+-      radv_cmd_buffer_upload_data(cmd_buffer, size, 4, data, &src_va);
++      if (!radv_cmd_buffer_upload_data(cmd_buffer, size, 4, data, &src_va))
 +         return;
  
-       const VkAddressCopyFlagsKHR src_copy_flags = radv_get_copy_flags_from_bo(cmd_buffer->upload.upload_bo);
-       const uint64_t src_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + buf_offset;
+       const VkAddressCopyFlagsKHR src_copy_flags =
+          radv_get_copy_flags_from_bo(cmd_buffer->linear_suballocators[RADV_SUBALLOCATOR_CPU_UPLOAD].bo);
 diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
-index f98a83e3054..e658c5de631 100644
+index d5d7ce0af72..cb571375265 100644
 --- a/src/amd/vulkan/radv_cmd_buffer.c
 +++ b/src/amd/vulkan/radv_cmd_buffer.c
-@@ -1528,7 +1528,13 @@ radv_cmd_buffer_resize_upload_buf(struct radv_cmd_buffer *cmd_buffer, uint64_t m
+@@ -1543,7 +1543,16 @@ radv_cmd_buffer_resize_linear_suballoc_buf(struct radv_cmd_buffer *cmd_buffer,
        return false;
     }
  
 -   radv_cs_add_buffer(device->ws, cs->b, bo);
-+   uint8_t *map = radv_buffer_map(device->ws, bo);
-+   if (!map) {
-+      vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-+      radv_bo_destroy(device, &cmd_buffer->vk.base, bo);
-+      return false;
++   uint8_t *map = NULL;
++   if (bo_flags & RADEON_FLAG_CPU_ACCESS) {
++      map = radv_buffer_map(device->ws, bo);
++      if (!map) {
++         vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++         radv_bo_destroy(device, &cmd_buffer->vk.base, bo);
++         return false;
++      }
 +   }
 +
-    if (cmd_buffer->upload.upload_bo) {
-       upload = malloc(sizeof(*upload));
+    if (suballoc->bo) {
+       saved_suballoc = malloc(sizeof(*saved_suballoc));
  
-@@ -1542,15 +1548,12 @@ radv_cmd_buffer_resize_upload_buf(struct radv_cmd_buffer *cmd_buffer, uint64_t m
-       list_add(&upload->list, &cmd_buffer->upload.list);
+@@ -1557,18 +1566,12 @@ radv_cmd_buffer_resize_linear_suballoc_buf(struct radv_cmd_buffer *cmd_buffer,
+       list_add(&saved_suballoc->list, &suballoc->list);
     }
  
 +   radv_cs_add_buffer(device->ws, cs->b, bo);
 +
-    cmd_buffer->upload.upload_bo = bo;
-    cmd_buffer->upload.size = new_size;
-    cmd_buffer->upload.offset = 0;
--   cmd_buffer->upload.map = radv_buffer_map(device->ws, cmd_buffer->upload.upload_bo);
+    suballoc->bo = bo;
+    suballoc->size = new_size;
+    suballoc->offset = 0;
 -
--   if (!cmd_buffer->upload.map) {
--      vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
--      return false;
+-   if (bo_flags & RADEON_FLAG_CPU_ACCESS) {
+-      suballoc->cpu_map = radv_buffer_map(device->ws, bo);
+-
+-      if (!suballoc->cpu_map) {
+-         vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+-         return false;
+-      }
 -   }
-+   cmd_buffer->upload.map = map;
++   suballoc->cpu_map = map;
  
-    radv_rmv_log_command_buffer_bo_create(device, cmd_buffer->upload.upload_bo, 0, cmd_buffer->upload.size, 0);
+    radv_rmv_log_command_buffer_bo_create(device, suballoc->bo, 0, suballoc->size, 0);
  
