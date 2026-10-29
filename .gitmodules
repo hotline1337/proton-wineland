@@ -151,4 +151,4 @@
 	url = https://github.com/DadSchoorse/vkBasalt.git
 [submodule "mesa"]
 	path = mesa
-	url = https://gitlab.freedesktop.org/mesa/mesa.git
+	url = https://gitlab.freedesktop.org/nanomatters/mesa.git
