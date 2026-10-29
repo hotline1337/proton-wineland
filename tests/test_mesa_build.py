@@ -89,7 +89,7 @@ snapshot:
         snapshots, _, _ = self.inspect()
         options = snapshots["OPTIONS"].split()
         for option in ("-Dvulkan-drivers=amd", "-Dgallium-drivers=", "-Dllvm=disabled",
-                       "-Damd-use-llvm=false", "-Dplatforms=x11,wayland", "-Dopengl=false",
+                       "-Damd-options=", "-Dplatforms=x11,wayland", "-Dopengl=false",
                        "-Dglx=disabled", "-Degl=disabled", "-Dgbm=disabled", "-Db_lto=false",
                        "-Dspirv-tools=disabled",
                        "--wrap-mode=nodownload", "-Dlibdrm:default_library=static",
@@ -114,15 +114,18 @@ snapshot:
             self.assertIsNotNone(loader_path)
             self.assertNotIn("mesa-xcb", loader_path[1])
 
-    def test_configure_depends_on_patches_and_xcb_stage(self):
+    def test_configure_depends_on_source_and_xcb_stage(self):
         _, database, _ = self.inspect()
         for arch in ("i386", "x86_64"):
             rule = self.rule(database, str(self.directory / f".mesa-{arch}-configure"))
             self.assertIn(f".mesa-xcb-{arch}-build", rule)
             self.assertIn(".mesa-post-source", rule)
         patched = self.rule(database, str(self.directory / ".mesa-post-source"))
+        self.assertIn(".mesa-upstream-post-source", patched)
+        self.assertIn(str(ROOT / "make/build-mesa.mk"), patched)
+        self.assertNotIn("patch --batch", patched)
         for patch in (ROOT / "patches/mesa").glob("*.patch"):
-            self.assertIn(str(patch), patched)
+            self.assertNotIn(str(patch), patched)
 
     def test_distribution_is_private_and_xcb_is_build_only(self):
         _, database, _ = self.inspect()
@@ -193,38 +196,42 @@ include {ROOT}/make/build-mesa.mk
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 
-    def test_relative_source_directory_applies_patches(self):
+    def test_relative_source_directory_copies_checkout(self):
         relative = os.path.relpath(self.source, self.build)
         self.prepare("SRCDIR=" + relative)
-        self.assertEqual(self.patched.read_text(), "new\n")
+        self.assertEqual(self.patched.read_text(), "old\n")
 
-    def test_unchanged_patchset_does_not_rebuild(self):
+    def test_unchanged_checkout_does_not_rebuild(self):
         self.prepare()
-        self.assertEqual(self.patched.read_text(), "new\n")
+        self.assertEqual(self.patched.read_text(), "old\n")
         previous = self.stamp.stat().st_mtime_ns
         result = self.prepare()
         self.assertEqual(self.stamp.stat().st_mtime_ns, previous)
         self.assertNotIn("patch --batch", result.stdout)
 
-    def test_modified_patch_is_applied_to_clean_upstream(self):
+    def test_modified_checkout_replaces_staged_source(self):
         self.prepare()
-        upstream_time = (self.source / "mesa/sample.c").stat().st_mtime_ns
-        os.utime(self.patched, ns=(upstream_time, upstream_time))
-        self.write_patch("fixed")
-        newer = self.stamp.stat().st_mtime_ns + 1
-        os.utime(self.patch, ns=(newer, newer))
+        (self.source / "mesa/sample.c").write_text("branch update\n")
         self.prepare()
-        self.assertEqual(self.patched.read_text(), "fixed\n")
+        self.assertEqual(self.patched.read_text(), "branch update\n")
 
-    def test_removed_patch_restores_original_source(self):
+    def test_unused_patch_changes_do_not_rebuild(self):
         self.prepare()
-        upstream_time = (self.source / "mesa/sample.c").stat().st_mtime_ns
-        os.utime(self.patched, ns=(upstream_time, upstream_time))
-        self.patch.unlink()
-        newer = self.stamp.stat().st_mtime_ns + 1
-        os.utime(self.patch.parent, ns=(newer, newer))
-        result = self.prepare()
-        self.assertEqual(self.patched.read_text(), "old\n", result.stdout + result.stderr)
+        previous = self.stamp.stat().st_mtime_ns
+        self.write_patch("unused kernel feature")
+        self.prepare()
+        self.assertEqual(self.stamp.stat().st_mtime_ns, previous)
+        self.assertEqual(self.patched.read_text(), "old\n")
+
+    def test_source_switch_removes_stale_files(self):
+        obsolete = self.source / "mesa/obsolete.c"
+        obsolete.write_text("old branch\n")
+        self.prepare()
+        staged = self.build / "src-mesa/obsolete.c"
+        self.assertTrue(staged.exists())
+        obsolete.unlink()
+        self.prepare()
+        self.assertFalse(staged.exists())
 
 
 class MesaPatchContentTests(unittest.TestCase):
@@ -259,7 +266,11 @@ class MesaPatchContentTests(unittest.TestCase):
 class MesaBrandingTests(unittest.TestCase):
     def test_branding_changes_only_the_public_driver_name(self):
         relative = Path("src/amd/vulkan/radv_physical_device.c")
-        original = (ROOT / "mesa" / relative).read_text()
+        current = (ROOT / "mesa" / relative).read_text()
+        old = 'snprintf(p->driverName, VK_MAX_DRIVER_NAME_SIZE, "radv");'
+        new = 'snprintf(p->driverName, VK_MAX_DRIVER_NAME_SIZE, "radv-salkim");'
+        self.assertEqual(current.count(new), 1)
+        original = current.replace(new, old)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / relative

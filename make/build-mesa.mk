@@ -1,6 +1,5 @@
 # RADV is private to Proton and selected only by PROTON_RADV=1.
 MESA_ARCHS := $(filter i386 x86_64,$(unix_ARCHS))
-MESA_PATCHES := $(sort $(wildcard $(SRC)/patches/mesa/*.patch))
 MESA_DEPENDS := wayland-protocols
 MESA_LDFLAGS := -Wl,--exclude-libs,libdrm.a:libdrm_amdgpu.a
 
@@ -16,7 +15,7 @@ MESA_MESON_ARGS := \
 	-Dallow-fallback-for=libdrm \
 	-Db_lto=false -Db_ndebug=true \
 	-Dvulkan-drivers=amd -Dgallium-drivers= -Dplatforms=x11,wayland \
-	-Dllvm=disabled -Damd-use-llvm=false \
+	-Dllvm=disabled -Damd-options= \
 	-Dopengl=false -Dglx=disabled -Degl=disabled -Dgbm=disabled \
 	-Dgles1=disabled -Dgles2=disabled -Dxlib-lease=disabled \
 	-Dvulkan-layers= -Dtools= \
@@ -42,9 +41,8 @@ $(MESA_LIBDRM_ARCHIVE):
 	printf '%s  %s\n' fc68f9d0ba2ea63c9432a299e14fea09fad7a8a66e8039fcd7802ca59f77b4f5 "$@.tmp" | sha256sum --check
 	mv "$@.tmp" "$@"
 
-$(OBJ)/.mesa-post-source: $(OBJ)/.mesa-upstream-post-source $(MESA_PATCHES) $(SRCDIR)/patches/mesa $(MESA_LIBDRM_ARCHIVE)
+$(OBJ)/.mesa-post-source: $(OBJ)/.mesa-upstream-post-source $(SRCDIR)/make/build-mesa.mk $(MESA_LIBDRM_ARCHIVE)
 	rsync -arc --delete --exclude=/subprojects/libdrm-2.4.133 "$(MESA_UPSTREAM_SRC)/" "$(MESA_SRC)/"
-	$(foreach p,$(MESA_PATCHES),patch --batch --fuzz=0 -d "$(MESA_SRC)" -Np1 -i "$(p)" &&) true
 	mkdir -p "$(MESA_LIBDRM)"
 	tar -xf "$(MESA_LIBDRM_ARCHIVE)" --strip-components=1 -C "$(MESA_LIBDRM)"
 	touch "$@"
@@ -78,7 +76,7 @@ $(foreach arch,$(MESA_ARCHS),$(eval $(call mesa-arch-rules,$(arch))))
 
 $(OBJ)/.mesa-metadata: $(addprefix $(OBJ)/.mesa-,$(addsuffix -dist,$(MESA_ARCHS))) $(SRCDIR)/make/mesa-package.py
 	python3 "$(SRCDIR)/make/mesa-package.py" metadata \
-	    "$(MESA_ORIGIN)" "$(SRCDIR)/patches/mesa" "$(DST_DIR)" $(MESA_ARCHS)
+	    "$(MESA_ORIGIN)" "$(DST_DIR)" $(MESA_ARCHS)
 	touch "$@"
 
 $(OBJ)/.mesa-notices: $(OBJ)/.mesa-post-source $(SRCDIR)/make/mesa-notices.py $(SRCDIR)/make/licenses/mesa-blake3.txt

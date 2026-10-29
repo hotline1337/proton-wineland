@@ -149,6 +149,13 @@ class MesaPackageTests(unittest.TestCase):
         result = json.loads((self.destination / "share/mesa/build.json").read_text())
         self.assertEqual(result, {"mesa": "a" * 40, "patches": ["1" * 40, "2" * 40], "architectures": ["x86_64", "i386"]})
 
+    def test_metadata_direct_checkout_has_no_external_patches(self):
+        self.patch("0001-unused.patch", "1" * 40)
+        with mock.patch.object(PACKAGE, "command", return_value="a" * 40):
+            PACKAGE.metadata(self.root, None, self.destination, ["x86_64", "i386"])
+        result = json.loads((self.destination / "share/mesa/build.json").read_text())
+        self.assertEqual(result, {"mesa": "a" * 40, "patches": [], "architectures": ["x86_64", "i386"]})
+
     def test_metadata_invalid_patch_or_duplicate_rejected(self):
         for invalid in ("short", "z" * 40):
             self.patch("0001.patch", invalid)
@@ -226,8 +233,8 @@ class MesaPackageTests(unittest.TestCase):
         for source_arg in (str(source), "../source"):
             with self.subTest(source=source_arg):
                 result = subprocess.run(
-                    [sys.executable, str(SCRIPT), "metadata", source_arg, "../patches",
-                     "../dist", "x86_64", "i386"],
+                    [sys.executable, str(SCRIPT), "metadata", source_arg,
+                     "../dist", "x86_64", "i386", "--patches", "../patches"],
                     cwd=build, capture_output=True, text=True, timeout=30,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

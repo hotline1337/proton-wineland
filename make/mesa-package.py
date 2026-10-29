@@ -82,14 +82,16 @@ def install(driver, upstream_manifest, destination, arch):
 def metadata(source, patches, destination, arches):
     for arch in arches:
         architecture(arch)
-    if not arches or not patches.is_dir():
-        raise ValueError("Mesa metadata requires architectures and a patch directory")
+    if not arches:
+        raise ValueError("Mesa metadata requires architectures")
+    if patches is not None and not patches.is_dir():
+        raise ValueError("Invalid Mesa patch directory")
     commit = command(["git", "-C", str(source), "rev-parse", "--verify", "HEAD"]).strip()
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("Invalid Mesa source commit")
     records = []
     seen = set()
-    for patch in sorted(patches.glob("*.patch")):
+    for patch in sorted(patches.glob("*.patch")) if patches is not None else ():
         content = patch.read_bytes()
         match = re.match(rb"From ([0-9a-f]{40}) ", content)
         if match:
@@ -152,8 +154,9 @@ def main():
         install_parser.add_argument(argument, type=pathlib.Path)
     install_parser.add_argument("arch", choices=ARCHITECTURES)
     metadata_parser = subcommands.add_parser("metadata")
-    for argument in ("source", "patches", "destination"):
+    for argument in ("source", "destination"):
         metadata_parser.add_argument(argument, type=pathlib.Path)
+    metadata_parser.add_argument("--patches", type=pathlib.Path)
     metadata_parser.add_argument("architectures", nargs="+", choices=ARCHITECTURES)
     data_parser = subcommands.add_parser("data")
     for argument in ("mesa", "libdrm", "destination"):
