@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile host tests against extracted production initialization functions."""
+"""Compile host tests against extracted initialization and matchmaking functions."""
 import argparse
 import hashlib
 import os
@@ -58,6 +58,23 @@ def main():
     pe = (ROOT / 'steamclient_main.c').read_text()
     unix = (ROOT / 'unixlib.cpp').read_text()
     header = (ROOT / 'unixlib.h').read_text()
+    matchmaking = (ROOT / 'steam_matchmaking_manual.c').read_text()
+    signatures = re.findall(r'^void \* __thiscall (winISteamMatchmakingServers_\w+_Request\w+ServerList)\(', matchmaking, re.M)
+    assert len(signatures) == 12
+    matchmaking_functions = '\n\n'.join(function(matchmaking, signature) for signature in (
+        'static struct w_request *alloc_w_request(', 'static void free_w_request(',
+        'static struct w_request *get_w_request('))
+    declarations, creators = [], []
+    for i, name in enumerate(signatures):
+        body = function(matchmaking, 'void * __thiscall ' + name + '(')
+        matchmaking_functions += '\n\n' + body
+        param_name = re.search(r'struct (ISteamMatchmakingServers_\w+_params) params', body).group(1)
+        declarations.append('REQUEST_PARAMS(' + param_name + ')')
+        arguments = '&iface, 42, NULL' if '_RequestLANServerList' in name else '&iface, 42, NULL, 0, NULL'
+        creators.append('static void *create_%d(void) { return %s(%s); }' % (i, name, arguments))
+    creators.append('static void *(*const creators[])(void) = {' + ', '.join('create_' + str(i) for i in range(len(signatures))) + '};')
+    request = re.search(r'^#define W_REQUEST_MAGIC .*$', header, re.M).group() + '\n'
+    request += function(header, 'struct w_request\n') + ';'
     policy(pe)
     params = re.search(r'struct steamclient_init_params\s*\{.*?\};', header, re.S).group()
     pe_functions = '\n\n'.join(function(pe, signature) for signature in (
@@ -68,9 +85,12 @@ def main():
         print(f'{name}: {hashlib.sha256(source.encode()).hexdigest()}')
     for name, extension, functions, compiler in (
         ('pe-init', 'c', pe_functions, os.environ.get('CC', 'cc')),
-        ('unix-init', 'cpp', unix_functions, os.environ.get('CXX', 'c++'))):
+        ('unix-init', 'cpp', unix_functions, os.environ.get('CXX', 'c++')),
+        ('matchmaking', 'c', matchmaking_functions, os.environ.get('CC', 'cc'))):
         template = (ROOT / 'native-tests' / f'{name}.{extension}.in').read_text()
         generated = template.replace('@PARAMS@', params).replace('@FUNCTIONS@', functions)
+        generated = generated.replace('@REQUEST@', request).replace('@DECLARATIONS@', '\n'.join(declarations))
+        generated = generated.replace('@CREATORS@', '\n'.join(creators))
         src = output / f'{name}.{extension}'
         src.write_text(generated)
         binary = output / name

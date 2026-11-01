@@ -42,3 +42,8 @@ Steam callback. Sanitizer timings are not performance results.
 These are focused host tests, not binary-layout validation or substitutes for
 building both Wine DLL architectures and running Steam games. No Steam
 installation, Wine prefix or installed Proton build is modified.
+
+The matchmaking fixture compiles the production request helpers and all twelve
+server-list request creators with mocked allocation and Steam calls. It checks
+allocation failure, native request failure, successful creation, cookie
+validation and cleanup. It does not validate Steam ABI layout.

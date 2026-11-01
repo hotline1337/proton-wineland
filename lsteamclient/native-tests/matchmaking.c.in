@@ -1,0 +1,117 @@
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define __thiscall
+#define TRACE(...) ((void)0)
+#define ERR(...) ((void)0)
+#define SecureZeroMemory(pointer, size) memset(pointer, 0, size)
+typedef uint64_t UINT64;
+typedef struct { int unused; } gameserveritem_t_165;
+typedef struct { int unused; } MatchMakingKeyValuePair_t;
+typedef struct { int unused; } w_ISteamMatchmakingServerListResponse_106;
+struct u_request { uint64_t handle; };
+struct u_response { uint64_t handle; };
+struct w_iface { uint64_t u_iface; };
+@REQUEST@
+
+#define REQUEST_PARAMS(name) struct name \
+{ \
+    uint64_t u_iface; \
+    uint32_t iApp; \
+    MatchMakingKeyValuePair_t **ppchFilters; \
+    uint32_t nFilters; \
+    w_ISteamMatchmakingServerListResponse_106 *pRequestServersResponse; \
+    struct w_request *_ret; \
+};
+@DECLARATIONS@
+
+static unsigned int allocations, frees, calls;
+static int allocation_fails, native_fails;
+static struct w_request *live;
+static struct w_iface iface = {0x123456};
+
+static void *test_calloc(size_t count, size_t size)
+{
+    ++allocations;
+    if (allocation_fails) return NULL;
+    assert(!live);
+    live = calloc(count, size);
+    assert(live);
+    return live;
+}
+
+static void test_free(void *ptr)
+{
+    assert(ptr == live);
+    assert(live->magic == 0);
+    ++frees;
+    live = NULL;
+    free(ptr);
+}
+
+static void native_request(struct w_request *request, uint64_t interface, uint32_t app)
+{
+    ++calls;
+    assert(interface == iface.u_iface);
+    assert(app == 42);
+    assert(request == live);
+    assert(request->magic == W_REQUEST_MAGIC);
+    assert(!request->u_request.handle);
+    assert(!request->u_response.handle);
+    assert(!request->details);
+    assert(!request->details_count);
+    request->u_request.handle = native_fails ? 0 : 0xcafe;
+}
+
+#define STEAMCLIENT_CALL(code, params) native_request((params)->_ret, (params)->u_iface, (params)->iApp)
+#define calloc test_calloc
+#define free test_free
+@FUNCTIONS@
+#undef calloc
+#undef free
+
+@CREATORS@
+
+int main(void)
+{
+    struct w_request invalid = {0};
+    struct w_request *request;
+    unsigned int i;
+
+    assert(!get_w_request(NULL));
+    assert(!get_w_request(&invalid));
+    invalid.magic = W_REQUEST_MAGIC ^ 1;
+    assert(!get_w_request(&invalid));
+    free_w_request(NULL);
+    assert(!frees);
+
+    for (i = 0; i < sizeof(creators) / sizeof(creators[0]); ++i)
+    {
+        allocations = frees = calls = 0;
+        allocation_fails = 1;
+        native_fails = 0;
+        assert(!creators[i]());
+        assert(allocations == 1 && calls == 0 && frees == 0 && !live);
+
+        allocations = frees = calls = 0;
+        allocation_fails = 0;
+        native_fails = 1;
+        assert(!creators[i]());
+        assert(allocations == 1 && calls == 1 && frees == 1 && !live);
+
+        allocations = frees = calls = 0;
+        native_fails = 0;
+        request = creators[i]();
+        assert(request == live);
+        assert(allocations == 1 && calls == 1 && frees == 0);
+        assert(get_w_request(request) == request);
+        assert(request->u_request.handle == 0xcafe);
+        free_w_request(request);
+        assert(frees == 1 && !live);
+    }
+    printf("Matchmaking: %u creators passed allocation failure, native failure and success. Handle checks passed.\n", i);
+    return 0;
+}

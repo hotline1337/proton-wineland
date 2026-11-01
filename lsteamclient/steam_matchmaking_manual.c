@@ -6,7 +6,7 @@ static struct w_request *alloc_w_request(void)
 {
     struct w_request *request;
 
-    request = calloc( 1, sizeof(*request) );
+    if (!(request = calloc( 1, sizeof(*request) ))) return NULL;
     request->magic = W_REQUEST_MAGIC;
     return request;
 }
@@ -54,6 +54,7 @@ void * __thiscall winISteamMatchmakingServers_SteamMatchMakingServers002_Request
 
     TRACE( "%p\n", _this );
 
+    if (!request) return NULL;
     params._ret = request;
 
     STEAMCLIENT_CALL( ISteamMatchmakingServers_SteamMatchMakingServers002_RequestInternetServerList, &params );
@@ -78,6 +79,7 @@ void * __thiscall winISteamMatchmakingServers_SteamMatchMakingServers002_Request
 
     TRACE( "%p, %p\n", _this, pRequestServersResponse );
 
+    if (!request) return NULL;
     params._ret = request;
     STEAMCLIENT_CALL( ISteamMatchmakingServers_SteamMatchMakingServers002_RequestLANServerList, &params );
     if (!request->u_request.handle)
@@ -103,6 +105,7 @@ void * __thiscall winISteamMatchmakingServers_SteamMatchMakingServers002_Request
 
     TRACE( "%p\n", _this );
 
+    if (!request) return NULL;
     params._ret = request;
 
     STEAMCLIENT_CALL( ISteamMatchmakingServers_SteamMatchMakingServers002_RequestFriendsServerList, &params );
@@ -129,6 +132,7 @@ void * __thiscall winISteamMatchmakingServers_SteamMatchMakingServers002_Request
 
     TRACE( "%p\n", _this );
 
+    if (!request) return NULL;
     params._ret = request;
 
     STEAMCLIENT_CALL( ISteamMatchmakingServers_SteamMatchMakingServers002_RequestFavoritesServerList, &params );
@@ -151,10 +155,11 @@ void * __thiscall winISteamMatchmakingServers_SteamMatchMakingServers002_Request
         .nFilters = nFilters,
         .pRequestServersResponse = pRequestServersResponse,
     };
-    struct w_request *request = alloc_w_request();;
+    struct w_request *request = alloc_w_request();
 
     TRACE( "%p\n", _this );
 
+    if (!request) return NULL;
     params._ret = request;
 
     STEAMCLIENT_CALL( ISteamMatchmakingServers_SteamMatchMakingServers002_RequestHistoryServerList, &params );
@@ -181,6 +186,7 @@ void * __thiscall winISteamMatchmakingServers_SteamMatchMakingServers002_Request
 
     TRACE( "%p\n", _this );
 
+    if (!request) return NULL;
     params._ret = request;
 
     STEAMCLIENT_CALL( ISteamMatchmakingServers_SteamMatchMakingServers002_RequestSpectatorServerList, &params );
@@ -279,6 +285,7 @@ void * __thiscall winISteamMatchmakingServers_SteamMatchMakingServers003_Request
 
     TRACE( "%p\n", _this );
 
+    if (!request) return NULL;
     params._ret = request;
 
     STEAMCLIENT_CALL( ISteamMatchmakingServers_SteamMatchMakingServers003_RequestInternetServerList, &params );
@@ -303,6 +310,7 @@ void * __thiscall winISteamMatchmakingServers_SteamMatchMakingServers003_Request
 
     TRACE( "%p\n", _this );
 
+    if (!request) return NULL;
     params._ret = request;
 
     STEAMCLIENT_CALL( ISteamMatchmakingServers_SteamMatchMakingServers003_RequestLANServerList, &params );
@@ -329,6 +337,7 @@ void * __thiscall winISteamMatchmakingServers_SteamMatchMakingServers003_Request
 
     TRACE( "%p\n", _this );
 
+    if (!request) return NULL;
     params._ret = request;
 
     STEAMCLIENT_CALL( ISteamMatchmakingServers_SteamMatchMakingServers003_RequestFriendsServerList, &params );
@@ -355,6 +364,7 @@ void * __thiscall winISteamMatchmakingServers_SteamMatchMakingServers003_Request
 
     TRACE( "%p\n", _this );
 
+    if (!request) return NULL;
     params._ret = request;
 
     STEAMCLIENT_CALL( ISteamMatchmakingServers_SteamMatchMakingServers003_RequestFavoritesServerList, &params );
@@ -381,6 +391,7 @@ void * __thiscall winISteamMatchmakingServers_SteamMatchMakingServers003_Request
 
     TRACE( "%p\n", _this );
 
+    if (!request) return NULL;
     params._ret = request;
 
     STEAMCLIENT_CALL( ISteamMatchmakingServers_SteamMatchMakingServers003_RequestHistoryServerList, &params );
@@ -407,6 +418,7 @@ void * __thiscall winISteamMatchmakingServers_SteamMatchMakingServers003_Request
 
     TRACE( "%p\n", _this );
 
+    if (!request) return NULL;
     params._ret = request;
 
     STEAMCLIENT_CALL( ISteamMatchmakingServers_SteamMatchMakingServers003_RequestSpectatorServerList, &params );
